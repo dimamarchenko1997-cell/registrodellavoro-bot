@@ -1,0 +1,7 @@
+aiogram==3.*
+fastapi
+uvicorn
+openpyxl
+python-dotenv
+aioschedule
+gunicorn
