@@ -5,3 +5,4 @@ openpyxl
 python-dotenv
 aioschedule
 gunicorn
+gspread
