@@ -26,7 +26,7 @@ dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
 # ---------------- Constants ----------------
-WORK_LOCATIONS = {"Ufficio Centrale": (45.6204762, 9.2401744)}
+WORK_LOCATIONS = {"Ufficio Centrale": (45.602129, 9.248768)}
 MAX_DISTANCE_METERS = 200
 
 # ---------------- FSM ----------------
