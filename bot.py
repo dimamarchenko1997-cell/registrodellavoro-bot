@@ -49,7 +49,7 @@ def get_sheet(sheet_name="Registro"):
 # ---------------- Constants ----------------
 WORK_LOCATIONS = {
     "Ufficio Centrale": (45.6204762, 9.2401744),
-    "Magazzino Bergamo": (45.698264, 9.677269),
+    "Magazzino Bergamo": (45.620625, 9.240152),
     "Sede Milano": (45.602130, 9.248742)
 }
 MAX_DISTANCE_METERS = 600
