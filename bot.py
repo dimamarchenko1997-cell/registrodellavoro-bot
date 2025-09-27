@@ -24,22 +24,23 @@ from google.oauth2.service_account import Credentials  # Nuova autenticazione mo
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN") or "PASTE_YOUR_TOKEN_HERE"
 SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")  # ID del tuo foglio Google Sheets
-CREDENTIALS_FILE = "credentials.json"  # Nome del file JSON con le credenziali
+CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")  # Contenuto JSON credentials come stringa
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
 # Funzione per connettersi a Google Sheets
 def get_sheet(sheet_name="Registro"):
+    if not CREDENTIALS_JSON:
+        raise ValueError("GOOGLE_CREDENTIALS non impostata!")
     try:
-        with open(CREDENTIALS_FILE, 'r') as f:
-            credentials_dict = json.load(f)
-        logging.info("Credenziali caricate dal file JSON con successo.")
-    except FileNotFoundError:
-        raise ValueError(f"File delle credenziali '{CREDENTIALS_FILE}' non trovato!")
+        credentials_dict = json.loads(CREDENTIALS_JSON)
+        logging.info("JSON caricato. Lunghezza private_key: " + str(len(credentials_dict.get("private_key", ""))))
+        if "private_key" not in credentials_dict or not credentials_dict["private_key"].startswith("-----BEGIN PRIVATE KEY-----"):
+            raise ValueError("Private_key malformata o mancante!")
     except json.JSONDecodeError as e:
-        raise ValueError("File JSON malformato: " + str(e))
-    
+        raise ValueError("JSON malformato: " + str(e))
+    # Resto del codice...
     scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
     client = gspread.authorize(creds)
@@ -49,10 +50,11 @@ def get_sheet(sheet_name="Registro"):
 # ---------------- Constants ----------------
 WORK_LOCATIONS = {
     "Ufficio Centrale": (45.6204762, 9.2401744),
-    "Magazzino Bergamo": (45.620625, 9.240152),
-    "Sede Milano": (45.602130, 9.248742)
+    " Iveco Cornaredo": (45.480555, 9.034716)
+
+
 }
-MAX_DISTANCE_METERS = 600
+MAX_DISTANCE_METERS = 200
 
 # ---------------- FSM ----------------
 class RegistroForm(StatesGroup):
