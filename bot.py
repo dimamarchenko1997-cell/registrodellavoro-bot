@@ -1,6 +1,7 @@
 import os
 import asyncio
 import calendar
+import json
 from datetime import datetime
 from math import radians, sin, cos, sqrt, atan2
 from aiogram import Bot, Dispatcher, F, types
@@ -10,24 +11,48 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from openpyxl import Workbook, load_workbook
 import aioschedule
 from dotenv import load_dotenv
 import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
+import gspread  # Per Google Sheets
+from google.oauth2.service_account import Credentials  # Nuova autenticazione moderna
 
 # ---------------- CONFIG ----------------
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN") or "PASTE_YOUR_TOKEN_HERE"
-EXCEL_FILE = "registro_lavoro.xlsx"
+SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")  # ID del tuo foglio Google Sheets
+CREDENTIALS_FILE = "credentials.json"  # Nome del file JSON con le credenziali
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
+# Funzione per connettersi a Google Sheets
+def get_sheet(sheet_name="Registro"):
+    try:
+        with open(CREDENTIALS_FILE, 'r') as f:
+            credentials_dict = json.load(f)
+        logging.info("Credenziali caricate dal file JSON con successo.")
+    except FileNotFoundError:
+        raise ValueError(f"File delle credenziali '{CREDENTIALS_FILE}' non trovato!")
+    except json.JSONDecodeError as e:
+        raise ValueError("File JSON malformato: " + str(e))
+    
+    scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(SHEET_ID).worksheet(sheet_name)
+    return sheet
+
 # ---------------- Constants ----------------
-WORK_LOCATIONS = {"Ufficio Centrale": (45.602129, 9.248768)}
-MAX_DISTANCE_METERS = 200
+WORK_LOCATIONS = {
+    "Ufficio Centrale": (45.6204762, 9.2401744),
+    "Magazzino Bergamo": (45.698264, 9.677269),
+    "Sede Milano": (45.602130, 9.248742)
+}
+MAX_DISTANCE_METERS = 600
 
 # ---------------- FSM ----------------
 class RegistroForm(StatesGroup):
@@ -39,30 +64,30 @@ class PermessiForm(StatesGroup):
     waiting_for_end = State()
     waiting_for_reason = State()
 
-# ---------------- Excel ----------------
-def init_excel():
-    if not os.path.exists(EXCEL_FILE):
-        wb = Workbook()
-        ws1 = wb.active
-        ws1.title = "Registro"
-        ws1.append(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
-        ws2 = wb.create_sheet("Permessi")
-        ws2.append(["Data richiesta", "Utente", "Dal", "Al", "Motivo"])
-        wb.save(EXCEL_FILE)
+# ---------------- Sheets Functions ----------------
+def init_sheets():
+    # Inizializza Registro
+    sheet_registro = get_sheet("Registro")
+    if not sheet_registro.row_values(1):
+        sheet_registro.append_row(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
+    
+    # Inizializza Permessi (foglio separato)
+    sheet_permessi = get_sheet("Permessi")
+    if not sheet_permessi.row_values(1):
+        sheet_permessi.append_row(["Data richiesta", "Utente", "Dal", "Al", "Motivo"])
 
 def save_ingresso(user: types.User, time, location_name):
     try:
-        wb = load_workbook(EXCEL_FILE)
-        ws = wb["Registro"]
+        sheet = get_sheet("Registro")
         today = datetime.now().strftime("%d.%m.%Y")
         user_id = f"{user.full_name} | {user.id}"
         # Controlla se esiste già un ingresso per oggi
-        for row in range(2, ws.max_row + 1):
-            if ws.cell(row, 1).value == today and ws.cell(row, 2).value == user_id:
+        rows = sheet.get_all_values()
+        for row in rows[1:]:  # Salta intestazione
+            if row[0] == today and row[1] == user_id:
                 logging.warning(f"Ingresso già registrato per {user_id} oggi.")
                 return False
-        ws.append([today, user_id, time, location_name, "", ""])
-        wb.save(EXCEL_FILE)
+        sheet.append_row([today, user_id, time, location_name, "", ""])
         return True
     except Exception as e:
         logging.error(f"Errore durante il salvataggio dell'ingresso: {e}")
@@ -70,15 +95,14 @@ def save_ingresso(user: types.User, time, location_name):
 
 def save_uscita(user: types.User, time, location_name):
     try:
-        wb = load_workbook(EXCEL_FILE)
-        ws = wb["Registro"]
+        sheet = get_sheet("Registro")
         today = datetime.now().strftime("%d.%m.%Y")
         user_id = f"{user.full_name} | {user.id}"
-        for row in range(ws.max_row, 0, -1):
-            if ws.cell(row, 1).value == today and ws.cell(row, 2).value == user_id and not ws.cell(row, 5).value:
-                ws.cell(row, 5, time)
-                ws.cell(row, 6, location_name)
-                wb.save(EXCEL_FILE)
+        rows = sheet.get_all_values()
+        for i, row in enumerate(rows[1:], start=2):  # Salta intestazione, indice da 2
+            if row[0] == today and row[1] == user_id and not row[4]:  # Se uscita vuota
+                sheet.update_cell(i, 5, time)  # Colonna 5: uscita ora
+                sheet.update_cell(i, 6, location_name)  # Colonna 6: posizione uscita
                 return True
         logging.warning(f"Nessun ingresso trovato per {user_id} oggi.")
         return False
@@ -94,12 +118,10 @@ def save_permesso(user: types.User, start_date, end_date, reason):
         if end_dt < start_dt:
             raise ValueError("La data di fine deve essere successiva o uguale alla data di inizio.")
         
-        wb = load_workbook(EXCEL_FILE)
-        ws = wb["Permessi"]
+        sheet = get_sheet("Permessi")
         today = datetime.now().strftime("%d.%m.%Y %H:%M")
         user_id = f"{user.full_name} | {user.id}"
-        ws.append([today, user_id, start_date, end_date, reason])
-        wb.save(EXCEL_FILE)
+        sheet.append_row([today, user_id, start_date, end_date, reason])
         return True
     except ValueError as ve:
         logging.error(f"Errore di validazione: {ve}")
@@ -143,7 +165,6 @@ def build_calendar(year: int, month: int, phase: str):
     giorni = ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"]
     
     # Prima riga: 3 celle con frecce più piccole e mese/anno più grande
-    # Riduci spazi per frecce (più piccole), aggiungi più spazi per mese (più grande)
     kb.button(text="⬅️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")
     kb.button(text=f"     {mese_nome(month)} {year}     ", callback_data="ignore")
     kb.button(text="➡️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")
@@ -161,7 +182,7 @@ def build_calendar(year: int, month: int, phase: str):
                 text_day = f"🔵{day}" if day == today.day and month == today.month and year == today.year else str(day)
                 kb.button(text=text_day, callback_data=f"perm:{phase}:day:{year}:{month}:{day}")
     
-    # Imposta le larghezze delle righe: prima riga 3, poi 7 per giorni, e 7 per ciascuna settimana
+    # Imposta le larghezze delle righe
     kb.adjust(3, 7, 7, 7, 7, 7, 7)
     
     return kb.as_markup()
@@ -286,14 +307,11 @@ async def permessi_reason(message: Message, state: FSMContext):
 async def notify_missing_ingresso():
     today = datetime.now().strftime("%d.%m.%Y")
     try:
-        wb = load_workbook(EXCEL_FILE)
-        ws = wb["Registro"]
-        # Qui dovresti avere una lista di utenti attesi. Per ora, assumiamo di loggare solo.
-        # Per inviare notifiche, avresti bisogno di una lista di user_id.
-        registered_users = {ws.cell(row, 2).value for row in range(2, ws.max_row + 1) if ws.cell(row, 1).value == today}
+        sheet = get_sheet("Registro")
+        rows = sheet.get_all_values()
+        registered_users = {row[1] for row in rows[1:] if row[0] == today}
         logging.info(f"[NOTIFY] Utenti con ingresso oggi ({today}): {registered_users}")
-        # Esempio: per inviare notifiche, loop su user_id noti e controlla se non in registered_users
-        # await bot.send_message(user_id, "Ricorda di registrare l'ingresso!")
+        # Esempio: invia notifiche se necessario
     except Exception as e:
         logging.error(f"Errore nella notifica: {e}")
 
@@ -303,7 +321,7 @@ async def scheduler():
         await asyncio.sleep(2)
 
 async def on_startup():
-    init_excel()
+    init_sheets()
     days = ["monday", "tuesday", "wednesday", "thursday", "friday"]
     for day in days:
         getattr(aioschedule.every(), day).at("09:00").do(notify_missing_ingresso)
@@ -311,22 +329,24 @@ async def on_startup():
     logging.info("🚀 Bot avviato con webhook su Render")
 
 # ---------------- FastAPI Setup ----------------
-app = FastAPI()
-
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     await on_startup()
+    yield
+    logging.info("Shutdown completato")
+
+app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
-        # Aggiungi context={"bot": bot} per la validazione corretta (richiesto da aiogram/pydantic)
         update = types.Update.model_validate(await request.json(), context={"bot": bot})
         await dp.feed_update(bot=bot, update=update)
-        return {"ok": True}  # Telegram si aspetta una risposta semplice con status 200
+        return {"ok": True}
     except Exception as e:
         logging.error(f"Errore nel webhook: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)  # Per debug, ma non obbligatorio
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 @app.get("/")
 async def health_check():
     return "Bot is running"
