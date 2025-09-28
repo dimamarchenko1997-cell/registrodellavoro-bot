@@ -2,6 +2,8 @@ import os
 import asyncio
 import calendar
 import json
+import csv  # Aggiunto per generare CSV
+import io  # Aggiunto per gestire file in memoria
 from datetime import datetime
 from math import radians, sin, cos, sqrt, atan2
 from aiogram import Bot, Dispatcher, F, types
@@ -152,16 +154,37 @@ def check_location(lat, lon):
             return name
     return None
 
+# ---------------- Nuova Funzione per Riepilogo ----------------
+async def get_riepilogo(user: types.User):
+    try:
+        sheet = get_sheet("Registro")
+        rows = sheet.get_all_values()
+        user_id = f"{user.full_name} | {user.id}"
+        user_rows = [row for row in rows if row[1] == user_id]  # Filtra per utente
+        if not user_rows:
+            return None  # Nessun dato
+        
+        # Genera CSV in memoria
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])  # Intestazione
+        writer.writerows(user_rows)
+        output.seek(0)
+        return output
+    except Exception as e:
+        logging.error(f"Errore durante il recupero del riepilogo: {e}")
+        return None
+
 # ---------------- Keyboards ----------------
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Ingresso")],
         [KeyboardButton(text="Uscita")],
-        [KeyboardButton(text="Richiesta permessi")]
+        [KeyboardButton(text="Richiesta permessi")],
+        [KeyboardButton(text="Riepilogo")]  # Nuovo bottone
     ],
     resize_keyboard=True
 )
-
 # ---------------- Calendar ----------------
 def mese_nome(month: int) -> str:
     mesi = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
