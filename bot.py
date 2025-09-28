@@ -2,8 +2,8 @@ import os
 import asyncio
 import calendar
 import json
-import csv  # Aggiunto per generare CSV
-import io  # Aggiunto per gestire file in memoria
+import csv
+import io
 from datetime import datetime
 from math import radians, sin, cos, sqrt, atan2
 from aiogram import Bot, Dispatcher, F, types
@@ -19,37 +19,31 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-import gspread  # Per Google Sheets
-from google.oauth2.service_account import Credentials  # Nuova autenticazione moderna
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ---------------- CONFIG ----------------
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN") or "PASTE_YOUR_TOKEN_HERE"
-SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")  # ID del tuo foglio Google Sheets
-CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")  # Contenuto JSON credentials come stringa
+SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")
+CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# Funzione per connettersi a Google Sheets
+# ---------------- Google Sheets ----------------
 def get_sheet(sheet_name="Registro"):
     if not CREDENTIALS_JSON:
         raise ValueError("GOOGLE_CREDENTIALS non impostata!")
     try:
         credentials_dict = json.loads(CREDENTIALS_JSON)
-
-        # 🔑 FIX: sostituire "\n" con newline reali nella private_key
         if "private_key" in credentials_dict:
             credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
-
-        logging.info("JSON caricato. Lunghezza private_key: " + str(len(credentials_dict.get("private_key", ""))))
         if "private_key" not in credentials_dict or not credentials_dict["private_key"].startswith("-----BEGIN PRIVATE KEY-----"):
             raise ValueError("Private_key malformata o mancante!")
-
     except json.JSONDecodeError as e:
         raise ValueError("JSON malformato: " + str(e))
 
-    # Scope Google API
     scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
     client = gspread.authorize(creds)
@@ -59,9 +53,7 @@ def get_sheet(sheet_name="Registro"):
 # ---------------- Constants ----------------
 WORK_LOCATIONS = {
     "Ufficio Centrale": (45.6204762, 9.2401744),
-    " Iveco Cornaredo": (45.480555, 9.034716)
-
-
+    "Iveco Cornaredo": (45.480555, 9.034716)
 }
 MAX_DISTANCE_METERS = 200
 
@@ -77,12 +69,9 @@ class PermessiForm(StatesGroup):
 
 # ---------------- Sheets Functions ----------------
 def init_sheets():
-    # Inizializza Registro
     sheet_registro = get_sheet("Registro")
     if not sheet_registro.row_values(1):
         sheet_registro.append_row(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
-    
-    # Inizializza Permessi (foglio separato)
     sheet_permessi = get_sheet("Permessi")
     if not sheet_permessi.row_values(1):
         sheet_permessi.append_row(["Data richiesta", "Utente", "Dal", "Al", "Motivo"])
@@ -92,11 +81,9 @@ def save_ingresso(user: types.User, time, location_name):
         sheet = get_sheet("Registro")
         today = datetime.now().strftime("%d.%m.%Y")
         user_id = f"{user.full_name} | {user.id}"
-        # Controlla se esiste già un ingresso per oggi
         rows = sheet.get_all_values()
-        for row in rows[1:]:  # Salta intestazione
+        for row in rows[1:]:
             if row[0] == today and row[1] == user_id:
-                logging.warning(f"Ingresso già registrato per {user_id} oggi.")
                 return False
         sheet.append_row([today, user_id, time, location_name, "", ""])
         return True
@@ -110,12 +97,11 @@ def save_uscita(user: types.User, time, location_name):
         today = datetime.now().strftime("%d.%m.%Y")
         user_id = f"{user.full_name} | {user.id}"
         rows = sheet.get_all_values()
-        for i, row in enumerate(rows[1:], start=2):  # Salta intestazione, indice da 2
-            if row[0] == today and row[1] == user_id and not row[4]:  # Se uscita vuota
-                sheet.update_cell(i, 5, time)  # Colonna 5: uscita ora
-                sheet.update_cell(i, 6, location_name)  # Colonna 6: posizione uscita
+        for i, row in enumerate(rows[1:], start=2):
+            if row[0] == today and row[1] == user_id and not row[4]:
+                sheet.update_cell(i, 5, time)
+                sheet.update_cell(i, 6, location_name)
                 return True
-        logging.warning(f"Nessun ingresso trovato per {user_id} oggi.")
         return False
     except Exception as e:
         logging.error(f"Errore durante il salvataggio dell'uscita: {e}")
@@ -123,20 +109,15 @@ def save_uscita(user: types.User, time, location_name):
 
 def save_permesso(user: types.User, start_date, end_date, reason):
     try:
-        # Validazione date
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
         if end_dt < start_dt:
             raise ValueError("La data di fine deve essere successiva o uguale alla data di inizio.")
-        
         sheet = get_sheet("Permessi")
         today = datetime.now().strftime("%d.%m.%Y %H:%M")
         user_id = f"{user.full_name} | {user.id}"
         sheet.append_row([today, user_id, start_date, end_date, reason])
         return True
-    except ValueError as ve:
-        logging.error(f"Errore di validazione: {ve}")
-        return False
     except Exception as e:
         logging.error(f"Errore durante il salvataggio del permesso: {e}")
         return False
@@ -154,20 +135,18 @@ def check_location(lat, lon):
             return name
     return None
 
-# ---------------- Nuova Funzione per Riepilogo ----------------
+# ---------------- Riepilogo ----------------
 async def get_riepilogo(user: types.User):
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
         user_id = f"{user.full_name} | {user.id}"
-        user_rows = [row for row in rows if row[1] == user_id]  # Filtra per utente
+        user_rows = [row for row in rows if row[1] == user_id]
         if not user_rows:
-            return None  # Nessun dato
-        
-        # Genera CSV in memoria
+            return None
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])  # Intestazione
+        writer.writerow(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
         writer.writerows(user_rows)
         output.seek(0)
         return output
@@ -181,10 +160,11 @@ main_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="Ingresso")],
         [KeyboardButton(text="Uscita")],
         [KeyboardButton(text="Richiesta permessi")],
-        [KeyboardButton(text="Riepilogo")]  # Nuovo bottone
+        [KeyboardButton(text="Riepilogo")]
     ],
     resize_keyboard=True
 )
+
 # ---------------- Calendar ----------------
 def mese_nome(month: int) -> str:
     mesi = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
@@ -195,15 +175,9 @@ def build_calendar(year: int, month: int, phase: str):
     kb = InlineKeyboardBuilder()
     today = datetime.now()
     giorni = ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"]
-    
-    # Prima riga: solo la data (mese e anno) al centro
     kb.button(text=f"{mese_nome(month)} {year}", callback_data="ignore")
-    
-    # Seconda riga: giorni della settimana
     for g in giorni:
         kb.button(text=g, callback_data="ignore")
-    
-    # Numeri del mese
     weeks = calendar.monthcalendar(year, month)
     for week in weeks:
         for day in week:
@@ -212,15 +186,10 @@ def build_calendar(year: int, month: int, phase: str):
             else:
                 text_day = f"🔵{day}" if day == today.day and month == today.month and year == today.year else str(day)
                 kb.button(text=text_day, callback_data=f"perm:{phase}:day:{year}:{month}:{day}")
-    
-    # Ultima riga: due grosse frecce per cambiare mese
-    kb.button(text="⬅️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")  # Freccia sinistra grossa
-    kb.button(text="➡️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")  # Freccia destra grossa
-    
-    # Imposta le larghezze: 1 (data), 7 (giorni), 7 per ciascuna settimana, 2 (frecce)
+    kb.button(text="⬅️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")
+    kb.button(text="➡️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")
     adjust_sizes = [1, 7] + [7 for _ in weeks] + [2]
     kb.adjust(*adjust_sizes)
-    
     return kb.as_markup()
 
 # ---------------- Handlers ----------------
@@ -336,8 +305,24 @@ async def permessi_reason(message: Message, state: FSMContext):
     if save_permesso(message.from_user, start_date, end_date, reason):
         await message.answer("✅ Permesso registrato!", reply_markup=main_kb)
     else:
-        await message.answer("❌ Errore nella registrazione del permesso (data non valida o altro problema).", reply_markup=main_kb)
+        await message.answer("❌ Errore nella registrazione del permesso.", reply_markup=main_kb)
     await state.clear()
+
+# ---- RIEPILOGO ----
+@dp.message(F.text == "Riepilogo")
+async def riepilogo_handler(message: Message):
+    output = await get_riepilogo(message.from_user)
+    if output:
+        output.seek(0)
+        await message.answer_document(
+            document=types.BufferedInputFile(
+                file=output.getvalue().encode("utf-8"),
+                filename="riepilogo.csv"
+            ),
+            caption="📊 Ecco il tuo riepilogo presenze"
+        )
+    else:
+        await message.answer("❌ Nessun dato trovato per te.")
 
 # ---------------- Scheduler ----------------
 async def notify_missing_ingresso():
@@ -347,7 +332,6 @@ async def notify_missing_ingresso():
         rows = sheet.get_all_values()
         registered_users = {row[1] for row in rows[1:] if row[0] == today}
         logging.info(f"[NOTIFY] Utenti con ingresso oggi ({today}): {registered_users}")
-        # Esempio: invia notifiche se necessario
     except Exception as e:
         logging.error(f"Errore nella notifica: {e}")
 
