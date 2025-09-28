@@ -214,8 +214,8 @@ def build_calendar(year: int, month: int, phase: str):
                 kb.button(text=text_day, callback_data=f"perm:{phase}:day:{year}:{month}:{day}")
     
     # Ultima riga: due grosse frecce per cambiare mese
-    kb.button(text="◀️◀️◀️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")  # Freccia sinistra grossa
-    kb.button(text="▶️▶️▶️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")  # Freccia destra grossa
+    kb.button(text="⬅️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")  # Freccia sinistra grossa
+    kb.button(text="➡️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")  # Freccia destra grossa
     
     # Imposta le larghezze: 1 (data), 7 (giorni), 7 per ciascuna settimana, 2 (frecce)
     adjust_sizes = [1, 7] + [7 for _ in weeks] + [2]
