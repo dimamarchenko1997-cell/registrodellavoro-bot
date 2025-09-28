@@ -166,19 +166,24 @@ main_kb = ReplyKeyboardMarkup(
 )
 
 # ---------------- Calendar ----------------
-def mese_nome(month: int) -> str:
-    mesi = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
-            "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"]
-    return mesi[month - 1]
-
 def build_calendar(year: int, month: int, phase: str):
     kb = InlineKeyboardBuilder()
     today = datetime.now()
     giorni = ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"]
+
+    # Prima riga: titolo
     kb.button(text=f"{mese_nome(month)} {year}", callback_data="ignore")
+
+    # Seconda riga: intestazione giorni
     for g in giorni:
         kb.button(text=g, callback_data="ignore")
+
+    # Otteniamo sempre 6 settimane (anche se alcune vuote)
     weeks = calendar.monthcalendar(year, month)
+    while len(weeks) < 6:
+        weeks.append([0] * 7)
+
+    # Giorni del mese
     for week in weeks:
         for day in week:
             if day == 0:
@@ -186,11 +191,16 @@ def build_calendar(year: int, month: int, phase: str):
             else:
                 text_day = f"🔵{day}" if day == today.day and month == today.month and year == today.year else str(day)
                 kb.button(text=text_day, callback_data=f"perm:{phase}:day:{year}:{month}:{day}")
+
+    # Ultima riga: frecce di navigazione
     kb.button(text="⬅️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")
     kb.button(text="➡️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")
-    adjust_sizes = [1, 7] + [7 for _ in weeks] + [2]
-    kb.adjust(*adjust_sizes)
+
+    # Imposta larghezze sempre uguali: 1 (titolo), 7 (giorni), 6x7 (settimane), 2 (frecce)
+    kb.adjust(1, 7, 7, 7, 7, 7, 7, 2)
+
     return kb.as_markup()
+
 
 # ---------------- Handlers ----------------
 @dp.message(F.text == "/start")
