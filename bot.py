@@ -2,6 +2,8 @@ import os
 import asyncio
 import calendar
 import json
+import csv  # Aggiunto per generare CSV
+import io  # Aggiunto per gestire file in memoria
 from datetime import datetime
 from math import radians, sin, cos, sqrt, atan2
 from aiogram import Bot, Dispatcher, F, types
@@ -58,8 +60,6 @@ def get_sheet(sheet_name="Registro"):
 WORK_LOCATIONS = {
     "Ufficio Centrale": (45.6204762, 9.2401744),
     " Iveco Cornaredo": (45.480555, 9.034716)
-
-
 }
 MAX_DISTANCE_METERS = 200
 
@@ -139,6 +139,27 @@ def save_permesso(user: types.User, start_date, end_date, reason):
         logging.error(f"Errore durante il salvataggio del permesso: {e}")
         return False
 
+# ---------------- Nuova Funzione per Riepilogo ----------------
+async def get_riepilogo(user: types.User):
+    try:
+        sheet = get_sheet("Registro")
+        rows = sheet.get_all_values()
+        user_id = f"{user.full_name} | {user.id}"
+        user_rows = [row for row in rows if row[1] == user_id]  # Filtra per utente
+        if not user_rows:
+            return None  # Nessun dato
+        
+        # Genera CSV in memoria
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])  # Intestazione
+        writer.writerows(user_rows)
+        output.seek(0)
+        return output
+    except Exception as e:
+        logging.error(f"Errore durante il recupero del riepilogo: {e}")
+        return None
+
 # ---------------- Location check ----------------
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000
@@ -157,7 +178,8 @@ main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Ingresso")],
         [KeyboardButton(text="Uscita")],
-        [KeyboardButton(text="Richiesta permessi")]
+        [KeyboardButton(text="Richiesta permessi")],
+        [KeyboardButton(text="Riepilogo")]  # Nuovo bottone
     ],
     resize_keyboard=True
 )
@@ -311,6 +333,21 @@ async def permessi_reason(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Errore nella registrazione del permesso (data non valida o altro problema).", reply_markup=main_kb)
     await state.clear()
+
+# ---------------- Nuova Handler per Riepilogo ----------------
+@dp.message(F.text == "Riepilogo")
+async def riepilogo_handler(message: Message):
+    riepilogo = await get_riepilogo(message.from_user)
+    if not riepilogo:
+        await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
+        return
+    
+    # Invia il CSV come documento
+    buffer = io.BytesIO(riepilogo.getvalue().encode('utf-8'))
+    buffer.name = "riepilogo_registro.csv"
+    buffer.seek(0)
+    await bot.send_document(message.chat.id, types.BufferedInputFile(buffer.read(), filename="riepilogo_registro.csv"))
+    await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
 
 # ---------------- Scheduler ----------------
 async def notify_missing_ingresso():
