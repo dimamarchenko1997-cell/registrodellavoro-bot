@@ -35,12 +35,19 @@ def get_sheet(sheet_name="Registro"):
         raise ValueError("GOOGLE_CREDENTIALS non impostata!")
     try:
         credentials_dict = json.loads(CREDENTIALS_JSON)
+
+        # 🔑 FIX: sostituire "\n" con newline reali nella private_key
+        if "private_key" in credentials_dict:
+            credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
+
         logging.info("JSON caricato. Lunghezza private_key: " + str(len(credentials_dict.get("private_key", ""))))
         if "private_key" not in credentials_dict or not credentials_dict["private_key"].startswith("-----BEGIN PRIVATE KEY-----"):
             raise ValueError("Private_key malformata o mancante!")
+
     except json.JSONDecodeError as e:
         raise ValueError("JSON malformato: " + str(e))
-    # Resto del codice...
+
+    # Scope Google API
     scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
     client = gspread.authorize(creds)
