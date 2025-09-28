@@ -166,6 +166,14 @@ main_kb = ReplyKeyboardMarkup(
 )
 
 # ---------------- Calendar ----------------
+
+def mese_nome(month: int) -> str:
+    mesi = [
+        "Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
+        "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"
+    ]
+    return mesi[month - 1]
+
 def build_calendar(year: int, month: int, phase: str):
     kb = InlineKeyboardBuilder()
     today = datetime.now()
