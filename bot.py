@@ -325,26 +325,46 @@ async def riepilogo_handler(message: Message):
         await message.answer("❌ Nessun dato trovato per te.")
 
 # ---------------- Scheduler ----------------
-async def notify_missing_ingresso():
+async def send_reminder(user_id, message):
+    try:
+        await bot.send_message(user_id, message)
+    except Exception as e:
+        logging.error(f"Errore nell'invio reminder a {user_id}: {e}")
+
+async def remind_ingresso():
     today = datetime.now().strftime("%d.%m.%Y")
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
-        registered_users = {row[1] for row in rows[1:] if row[0] == today}
-        logging.info(f"[NOTIFY] Utenti con ingresso oggi ({today}): {registered_users}")
+        all_users = set(row[1] for row in rows[1:])  # Tutti utenti unici dal sheet
+        registered_today = set(row[1] for row in rows[1:] if row[0] == today and row[2])  # Con ingresso oggi (colonna C non vuota)
+        missing_users = all_users - registered_today
+        for user_str in missing_users:
+            user_id = int(user_str.split(" | ")[1])  # Estrai ID da "Nome | ID"
+            await send_reminder(user_id, "Ricorda di registrare l'ingresso entro le 9:00!")
     except Exception as e:
-        logging.error(f"Errore nella notifica: {e}")
+        logging.error(f"Errore nel reminder ingresso: {e}")
 
-async def scheduler():
-    while True:
-        await aioschedule.run_pending()
-        await asyncio.sleep(2)
+async def remind_uscita():
+    today = datetime.now().strftime("%d.%m.%Y")
+    try:
+        sheet = get_sheet("Registro")
+        rows = sheet.get_all_values()
+        all_users_today = set(row[1] for row in rows[1:] if row[0] == today and row[2])  # Con ingresso oggi
+        exited_today = set(row[1] for row in rows[1:] if row[0] == today and row[4])  # Con uscita oggi
+        missing_exit = all_users_today - exited_today
+        for user_str in missing_exit:
+            user_id = int(user_str.split(" | ")[1])
+            await send_reminder(user_id, "Non dimenticare di registrare l'uscita!")
+    except Exception as e:
+        logging.error(f"Errore nel reminder uscita: {e}")
 
 async def on_startup():
     init_sheets()
     days = ["monday", "tuesday", "wednesday", "thursday", "friday"]
     for day in days:
-        getattr(aioschedule.every(), day).at("09:00").do(notify_missing_ingresso)
+        getattr(aioschedule.every(), day).at("09:00").do(remind_ingresso)
+        getattr(aioschedule.every(), day).at("16:00").do(remind_uscita)
     asyncio.create_task(scheduler())
     logging.info("🚀 Bot avviato con webhook su Render")
 
