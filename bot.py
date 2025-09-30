@@ -19,14 +19,14 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import gspread  # Per Google Sheets
 from google.oauth2.service_account import Credentials  # Nuova autenticazione moderna
-import pytz  # Aggiunto per gestire timezone
+import csv  # Per CSV
+import io  # Per file in memoria
 
 # ---------------- CONFIG ----------------
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN") or "PASTE_YOUR_TOKEN_HERE"
 SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")  # ID del tuo foglio Google Sheets
 CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")  # Contenuto JSON credentials come stringa
-TIMEZONE = pytz.timezone('Europe/Rome')  # Timezone per l'Italia (gestisce CEST/CET automaticamente)
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
@@ -88,9 +88,7 @@ def init_sheets():
 def save_ingresso(user: types.User, time, location_name):
     try:
         sheet = get_sheet("Registro")
-        now_local = datetime.now(TIMEZONE)  # Ora locale
-        today = now_local.strftime("%d.%m.%Y")
-        time_local = now_local.strftime("%H:%M")  # Ora corretta
+        today = datetime.now().strftime("%d.%m.%Y")
         user_id = f"{user.full_name} | {user.id}"
         # Controlla se esiste già un ingresso per oggi
         rows = sheet.get_all_values()
@@ -98,7 +96,7 @@ def save_ingresso(user: types.User, time, location_name):
             if row[0] == today and row[1] == user_id:
                 logging.warning(f"Ingresso già registrato per {user_id} oggi.")
                 return False
-        sheet.append_row([today, user_id, time_local, location_name, "", ""])
+        sheet.append_row([today, user_id, time, location_name, "", ""])
         return True
     except Exception as e:
         logging.error(f"Errore durante il salvataggio dell'ingresso: {e}")
@@ -107,14 +105,12 @@ def save_ingresso(user: types.User, time, location_name):
 def save_uscita(user: types.User, time, location_name):
     try:
         sheet = get_sheet("Registro")
-        now_local = datetime.now(TIMEZONE)  # Ora locale
-        today = now_local.strftime("%d.%m.%Y")
-        time_local = now_local.strftime("%H:%M")  # Ora corretta
+        today = datetime.now().strftime("%d.%m.%Y")
         user_id = f"{user.full_name} | {user.id}"
         rows = sheet.get_all_values()
         for i, row in enumerate(rows[1:], start=2):  # Salta intestazione, indice da 2
             if row[0] == today and row[1] == user_id and not row[4]:  # Se uscita vuota
-                sheet.update_cell(i, 5, time_local)  # Colonna 5: uscita ora
+                sheet.update_cell(i, 5, time)  # Colonna 5: uscita ora
                 sheet.update_cell(i, 6, location_name)  # Colonna 6: posizione uscita
                 return True
         logging.warning(f"Nessun ingresso trovato per {user_id} oggi.")
@@ -132,8 +128,7 @@ def save_permesso(user: types.User, start_date, end_date, reason):
             raise ValueError("La data di fine deve essere successiva o uguale alla data di inizio.")
         
         sheet = get_sheet("Permessi")
-        now_local = datetime.now(TIMEZONE)  # Ora locale
-        today = now_local.strftime("%d.%m.%Y %H:%M")
+        today = datetime.now().strftime("%d.%m.%Y %H:%M")
         user_id = f"{user.full_name} | {user.id}"
         sheet.append_row([today, user_id, start_date, end_date, reason])
         return True
@@ -143,6 +138,27 @@ def save_permesso(user: types.User, start_date, end_date, reason):
     except Exception as e:
         logging.error(f"Errore durante il salvataggio del permesso: {e}")
         return False
+
+# ---------------- Nuova Funzione per Riepilogo ----------------
+async def get_riepilogo(user: types.User):
+    try:
+        sheet = get_sheet("Registro")
+        rows = sheet.get_all_values()
+        user_id = f"{user.full_name} | {user.id}"
+        user_rows = [row for row in rows if row[1] == user_id]  # Filtra per utente
+        if not user_rows:
+            return None  # Nessun dato
+        
+        # Genera CSV in memoria
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])  # Intestazione
+        writer.writerows(user_rows)
+        output.seek(0)
+        return output
+    except Exception as e:
+        logging.error(f"Errore durante il recupero del riepilogo: {e}")
+        return None
 
 # ---------------- Location check ----------------
 def haversine(lat1, lon1, lat2, lon2):
@@ -162,7 +178,8 @@ main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Ingresso")],
         [KeyboardButton(text="Uscita")],
-        [KeyboardButton(text="Richiesta permessi")]
+        [KeyboardButton(text="Richiesta permessi")],
+        [KeyboardButton(text="Riepilogo")]  # Nuovo bottone
     ],
     resize_keyboard=True
 )
@@ -196,8 +213,8 @@ def build_calendar(year: int, month: int, phase: str):
                 kb.button(text=text_day, callback_data=f"perm:{phase}:day:{year}:{month}:{day}")
     
     # Ultima riga: due grosse frecce per cambiare mese
-    kb.button(text="⬅️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")  # Freccia sinistra grossa
-    kb.button(text="➡️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")  # Freccia destra grossa
+    kb.button(text="◀️◀️◀️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")  # Freccia sinistra grossa
+    kb.button(text="▶️▶️▶️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")  # Freccia destra grossa
     
     # Imposta le larghezze: 1 (data), 7 (giorni), 7 per ciascuna settimana, 2 (frecce)
     adjust_sizes = [1, 7] + [7 for _ in weeks] + [2]
@@ -224,7 +241,7 @@ async def ingresso_location(message: Message, state: FSMContext):
     loc = message.location
     location_name = check_location(loc.latitude, loc.longitude)
     if location_name:
-        now = datetime.now(TIMEZONE).strftime("%H:%M")
+        now = datetime.now().strftime("%H:%M")
         if save_ingresso(message.from_user, now, location_name):
             await message.answer("✅ Ingresso registrato!", reply_markup=main_kb)
         else:
@@ -247,7 +264,7 @@ async def uscita_location(message: Message, state: FSMContext):
     loc = message.location
     location_name = check_location(loc.latitude, loc.longitude)
     if location_name:
-        now = datetime.now(TIMEZONE).strftime("%H:%M")
+        now = datetime.now().strftime("%H:%M")
         if save_uscita(message.from_user, now, location_name):
             await message.answer("✅ Uscita registrata!", reply_markup=main_kb)
         else:
@@ -260,7 +277,7 @@ async def uscita_location(message: Message, state: FSMContext):
 @dp.message(F.text == "Richiesta permessi")
 async def permessi_start(message: Message, state: FSMContext):
     await state.set_state(PermessiForm.waiting_for_start)
-    now = datetime.now(TIMEZONE)
+    now = datetime.now()
     await message.answer("📅 Seleziona data di inizio:", reply_markup=build_calendar(now.year, now.month, "start"))
 
 @dp.callback_query(F.data.startswith("perm:"))
@@ -321,9 +338,24 @@ async def permessi_reason(message: Message, state: FSMContext):
         await message.answer("❌ Errore nella registrazione del permesso (data non valida o altro problema).", reply_markup=main_kb)
     await state.clear()
 
+# ---------------- Nuova Handler per Riepilogo ----------------
+@dp.message(F.text == "Riepilogo")
+async def riepilogo_handler(message: Message):
+    riepilogo = await get_riepilogo(message.from_user)
+    if not riepilogo:
+        await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
+        return
+    
+    # Invia il CSV come documento
+    buffer = io.BytesIO(riepilogo.getvalue().encode('utf-8'))
+    buffer.name = "riepilogo_registro.csv"
+    buffer.seek(0)
+    await bot.send_document(message.chat.id, types.BufferedInputFile(buffer.read(), filename="riepilogo_registro.csv"))
+    await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
+
 # ---------------- Scheduler ----------------
 async def notify_missing_ingresso():
-    today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+    today = datetime.now().strftime("%d.%m.%Y")
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
@@ -355,22 +387,4 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        update = types.Update.model_validate(await request.json(), context={"bot": bot})
-        await dp.feed_update(bot=bot, update=update)
-        return {"ok": True}
-    except Exception as e:
-        logging.error(f"Errore nel webhook: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-@app.get("/")
-async def health_check():
-    return "Bot is running"
-
-# ---------------- Main ----------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+@app.post
