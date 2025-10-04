@@ -344,6 +344,21 @@ async def permessi_reason(message: Message, state: FSMContext):
         await message.answer("❌ Errore nella registrazione del permesso (data non valida o altro problema).", reply_markup=main_kb)
     await state.clear()
 
+# ---------------- Nuova Handler per Riepilogo ----------------
+@dp.message(F.text == "Riepilogo")
+async def riepilogo_handler(message: Message):
+    riepilogo = await get_riepilogo(message.from_user)
+    if not riepilogo:
+        await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
+        return
+    
+    # Invia il CSV come documento
+    buffer = io.BytesIO(riepilogo.getvalue().encode('utf-8'))
+    buffer.name = "riepilogo_registro.csv"
+    buffer.seek(0)
+    await bot.send_document(message.chat.id, types.BufferedInputFile(buffer.read(), filename="riepilogo_registro.csv"))
+    await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
+
 # ---------------- Scheduler ----------------
 async def notify_missing_ingresso():
     today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
