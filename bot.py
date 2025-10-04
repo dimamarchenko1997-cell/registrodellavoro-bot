@@ -166,7 +166,6 @@ async def get_riepilogo(user: types.User):
     except Exception as e:
         logging.error(f"Errore durante il recupero del riepilogo: {e}")
         return None
-
 # ---------------- Location check ----------------
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000
