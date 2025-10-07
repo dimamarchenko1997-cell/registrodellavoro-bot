@@ -26,32 +26,26 @@ import pytz  # Per timezone
 # ---------------- CONFIG ----------------
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN") or "PASTE_YOUR_TOKEN_HERE"
-SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")  # ID del tuo foglio Google Sheets
-CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")  # Contenuto JSON credentials come stringa
-TIMEZONE = pytz.timezone('Europe/Rome')  # Timezone per l'Italia
+SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")
+CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
+TIMEZONE = pytz.timezone('Europe/Rome')
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# Funzione per connettersi a Google Sheets
+# ---------------- Google Sheets ----------------
 def get_sheet(sheet_name="Registro"):
     if not CREDENTIALS_JSON:
         raise ValueError("GOOGLE_CREDENTIALS non impostata!")
     try:
         credentials_dict = json.loads(CREDENTIALS_JSON)
-
-        # 🔑 FIX: sostituire "\n" con newline reali nella private_key
         if "private_key" in credentials_dict:
             credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
-
-        logging.info("JSON caricato. Lunghezza private_key: " + str(len(credentials_dict.get("private_key", ""))))
         if "private_key" not in credentials_dict or not credentials_dict["private_key"].startswith("-----BEGIN PRIVATE KEY-----"):
             raise ValueError("Private_key malformata o mancante!")
-
     except json.JSONDecodeError as e:
         raise ValueError("JSON malformato: " + str(e))
 
-    # Scope Google API
     scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
     client = gspread.authorize(creds)
@@ -78,12 +72,9 @@ class PermessiForm(StatesGroup):
 
 # ---------------- Sheets Functions ----------------
 def init_sheets():
-    # Inizializza Registro
     sheet_registro = get_sheet("Registro")
     if not sheet_registro.row_values(1):
         sheet_registro.append_row(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
-    
-    # Inizializza Permessi (foglio separato)
     sheet_permessi = get_sheet("Permessi")
     if not sheet_permessi.row_values(1):
         sheet_permessi.append_row(["Data richiesta", "Utente", "Dal", "Al", "Motivo"])
@@ -95,9 +86,8 @@ def save_ingresso(user: types.User, time, location_name):
         today = now_local.strftime("%d.%m.%Y")
         time_local = now_local.strftime("%H:%M")
         user_id = f"{user.full_name} | {user.id}"
-        # Controlla se esiste già un ingresso per oggi
         rows = sheet.get_all_values()
-        for row in rows[1:]:  # Salta intestazione
+        for row in rows[1:]:
             if row[0] == today and row[1] == user_id:
                 logging.warning(f"Ingresso già registrato per {user_id} oggi.")
                 return False
@@ -115,10 +105,10 @@ def save_uscita(user: types.User, time, location_name):
         time_local = now_local.strftime("%H:%M")
         user_id = f"{user.full_name} | {user.id}"
         rows = sheet.get_all_values()
-        for i, row in enumerate(rows[1:], start=2):  # Salta intestazione, indice da 2
-            if row[0] == today and row[1] == user_id and not row[4]:  # Se uscita vuota
-                sheet.update_cell(i, 5, time_local)  # Colonna 5: uscita ora
-                sheet.update_cell(i, 6, location_name)  # Colonna 6: posizione uscita
+        for i, row in enumerate(rows[1:], start=2):
+            if row[0] == today and row[1] == user_id and not row[4]:
+                sheet.update_cell(i, 5, time_local)
+                sheet.update_cell(i, 6, location_name)
                 return True
         logging.warning(f"Nessun ingresso trovato per {user_id} oggi.")
         return False
@@ -128,12 +118,10 @@ def save_uscita(user: types.User, time, location_name):
 
 def save_permesso(user: types.User, start_date, end_date, reason):
     try:
-        # Validazione date
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
         if end_dt < start_dt:
             raise ValueError("La data di fine deve essere successiva o uguale alla data di inizio.")
-        
         sheet = get_sheet("Permessi")
         now_local = datetime.now(TIMEZONE)
         today = now_local.strftime("%d.%m.%Y %H:%M")
@@ -147,26 +135,25 @@ def save_permesso(user: types.User, start_date, end_date, reason):
         logging.error(f"Errore durante il salvataggio del permesso: {e}")
         return False
 
-# ---------------- Nuova Funzione per Riepilogo ----------------
+# ---------------- Riepilogo ----------------
 async def get_riepilogo(user: types.User):
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
         user_id = f"{user.full_name} | {user.id}"
-        user_rows = [row for row in rows if row[1] == user_id]  # Filtra per utente
+        user_rows = [row for row in rows if row[1] == user_id]
         if not user_rows:
-            return None  # Nessun dato
-        
-        # Genera CSV in memoria
+            return None
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])  # Intestazione
+        writer.writerow(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
         writer.writerows(user_rows)
         output.seek(0)
         return output
     except Exception as e:
         logging.error(f"Errore durante il recupero del riepilogo: {e}")
         return None
+
 # ---------------- Location check ----------------
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000
@@ -186,7 +173,7 @@ main_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="Ingresso")],
         [KeyboardButton(text="Uscita")],
         [KeyboardButton(text="Richiesta permessi")],
-        [KeyboardButton(text="Riepilogo")]  # Nuovo bottone
+        [KeyboardButton(text="Riepilogo")]
     ],
     resize_keyboard=True
 )
@@ -201,15 +188,9 @@ def build_calendar(year: int, month: int, phase: str):
     kb = InlineKeyboardBuilder()
     today = datetime.now(TIMEZONE)
     giorni = ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"]
-    
-    # Prima riga: solo la data (mese e anno) al centro
     kb.button(text=f"{mese_nome(month)} {year}", callback_data="ignore")
-    
-    # Seconda riga: giorni della settimana
     for g in giorni:
         kb.button(text=g, callback_data="ignore")
-    
-    # Numeri del mese
     weeks = calendar.monthcalendar(year, month)
     for week in weeks:
         for day in week:
@@ -218,15 +199,10 @@ def build_calendar(year: int, month: int, phase: str):
             else:
                 text_day = f"🔵{day}" if day == today.day and month == today.month and year == today.year else str(day)
                 kb.button(text=text_day, callback_data=f"perm:{phase}:day:{year}:{month}:{day}")
-    
-    # Ultima riga: due grosse frecce per cambiare mese
-    kb.button(text="⬅️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")  # Freccia sinistra grossa
-    kb.button(text="➡️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")  # Freccia destra grossa
-    
-    # Imposta le larghezze: 1 (data), 7 (giorni), 7 per ciascuna settimana, 2 (frecce)
+    kb.button(text="◀️◀️◀️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")
+    kb.button(text="▶️▶️▶️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")
     adjust_sizes = [1, 7] + [7 for _ in weeks] + [2]
     kb.adjust(*adjust_sizes)
-    
     return kb.as_markup()
 
 # ---------------- Handlers ----------------
@@ -237,10 +213,7 @@ async def start_handler(message: Message):
 @dp.message(F.text == "Ingresso")
 async def ingresso_start(message: Message, state: FSMContext):
     await state.set_state(RegistroForm.waiting_ingresso_location)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
-        resize_keyboard=True
-    )
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]], resize_keyboard=True)
     await message.answer("Invia la tua posizione per registrare l'ingresso:", reply_markup=kb)
 
 @dp.message(RegistroForm.waiting_ingresso_location, F.location)
@@ -260,10 +233,7 @@ async def ingresso_location(message: Message, state: FSMContext):
 @dp.message(F.text == "Uscita")
 async def uscita_start(message: Message, state: FSMContext):
     await state.set_state(RegistroForm.waiting_uscita_location)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
-        resize_keyboard=True
-    )
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]], resize_keyboard=True)
     await message.answer("Invia la tua posizione per registrare l'uscita:", reply_markup=kb)
 
 @dp.message(RegistroForm.waiting_uscita_location, F.location)
@@ -280,7 +250,7 @@ async def uscita_location(message: Message, state: FSMContext):
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
     await state.clear()
 
-# ---- PERMESSI ----
+# ---------------- Permessi ----------------
 @dp.message(F.text == "Richiesta permessi")
 async def permessi_start(message: Message, state: FSMContext):
     await state.set_state(PermessiForm.waiting_for_start)
@@ -321,16 +291,12 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
         if phase == "start":
             await state.update_data(start_date=selected)
             await state.set_state(PermessiForm.waiting_for_end)
-            await cb.message.edit_text(
-                f"📅 Inizio selezionato: {selected}\nSeleziona la data di fine:",
-                reply_markup=build_calendar(year, month, "end")
-            )
+            await cb.message.edit_text(f"📅 Inizio selezionato: {selected}\nSeleziona la data di fine:",
+                                       reply_markup=build_calendar(year, month, "end"))
         elif phase == "end":
             await state.update_data(end_date=selected)
             await state.set_state(PermessiForm.waiting_for_reason)
-            await cb.message.edit_text(
-                f"📅 Fine selezionata: {selected}\nOra scrivi il motivo del permesso:"
-            )
+            await cb.message.edit_text(f"📅 Fine selezionata: {selected}\nOra scrivi il motivo del permesso:")
         await cb.answer()
 
 @dp.message(PermessiForm.waiting_for_reason)
@@ -342,18 +308,16 @@ async def permessi_reason(message: Message, state: FSMContext):
     if save_permesso(message.from_user, start_date, end_date, reason):
         await message.answer("✅ Permesso registrato!", reply_markup=main_kb)
     else:
-        await message.answer("❌ Errore nella registrazione del permesso (data non valida o altro problema).", reply_markup=main_kb)
+        await message.answer("❌ Errore nella registrazione del permesso.", reply_markup=main_kb)
     await state.clear()
 
-# ---------------- Nuova Handler per Riepilogo ----------------
+# ---------------- Riepilogo ----------------
 @dp.message(F.text == "Riepilogo")
 async def riepilogo_handler(message: Message):
     riepilogo = await get_riepilogo(message.from_user)
     if not riepilogo:
         await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
         return
-    
-    # Invia il CSV come documento
     buffer = io.BytesIO(riepilogo.getvalue().encode('utf-8'))
     buffer.name = "riepilogo_registro.csv"
     buffer.seek(0)
@@ -361,7 +325,7 @@ async def riepilogo_handler(message: Message):
     await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
 
 # ---------------- Scheduler ----------------
-async def send_reminder(user_id, message):
+async def send_reminder(user_id: int, message: str):
     try:
         await bot.send_message(user_id, message)
         logging.info(f"Reminder inviato a {user_id}")
@@ -373,14 +337,18 @@ async def remind_ingresso():
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
-        all_users = set(row[1] for row in rows[1:])  # Tutti utenti unici
-        registered_today = set(row[1] for row in rows[1:] if row[0] == today and row[2])  # Con ingresso oggi (colonna C non vuota)
+        if len(rows) < 2:
+            return
+        all_users = set(row[1] for row in rows[1:] if len(row) > 1)
+        registered_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
         missing_users = all_users - registered_today
         for user_str in missing_users:
-            name, user_id = user_str.split(" | ")
-            user_id = int(user_id)
-            message = f"Ciao {name}, ricorda di registrare l'ingresso"
-            await send_reminder(user_id, message)
+            try:
+                name, user_id = user_str.split(" | ")
+                user_id = int(user_id)
+                await send_reminder(user_id, f"Ciao {name}, ricorda di registrare l'ingresso entro le 9:00!")
+            except Exception as e:
+                logging.error(f"Errore reminder ingresso per {user_str}: {e}")
     except Exception as e:
         logging.error(f"Errore nel reminder ingresso: {e}")
 
@@ -389,25 +357,34 @@ async def remind_uscita():
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
-        all_users_today = set(row[1] for row in rows[1:] if row[0] == today and row[2])  # Con ingresso oggi
-        exited_today = set(row[1] for row in rows[1:] if row[0] == today and row[4])  # Con uscita oggi
+        if len(rows) < 2:
+            return
+        all_users_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
+        exited_today = set(row[1] for row in rows[1:] if len(row) > 4 and row[0] == today and row[4])
         missing_exit = all_users_today - exited_today
         for user_str in missing_exit:
-            name, user_id = user_str.split(" | ")
-            user_id = int(user_id)
-            message = f"Ciao {name}, non dimenticare di registrare l'uscita!"
-            await send_reminder(user_id, message)
+            try:
+                name, user_id = user_str.split(" | ")
+                user_id = int(user_id)
+                await send_reminder(user_id, f"Ciao {name}, non dimenticare di registrare l'uscita!")
+            except Exception as e:
+                logging.error(f"Errore reminder uscita per {user_str}: {e}")
     except Exception as e:
         logging.error(f"Errore nel reminder uscita: {e}")
 
+async def scheduler():
+    while True:
+        await aioschedule.run_pending()
+        await asyncio.sleep(60)
+
 async def on_startup():
     init_sheets()
-    days = ["monday", "tuesday", "wednesday", "thursday", "friday"]
-    for day in days:
+    weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday"]
+    for day in weekdays:
         getattr(aioschedule.every(), day).at("08:30").do(remind_ingresso)
         getattr(aioschedule.every(), day).at("16:00").do(remind_uscita)
     asyncio.create_task(scheduler())
-    logging.info("🚀 Bot avviato con webhook su Render")
+    logging.info("🚀 Bot avviato con scheduler per reminder ingresso/uscita")
 
 # ---------------- FastAPI Setup ----------------
 @asynccontextmanager
@@ -437,3 +414,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
