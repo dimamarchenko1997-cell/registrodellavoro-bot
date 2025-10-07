@@ -165,11 +165,12 @@ async def get_riepilogo(user: types.User):
 # ---------------- Keyboards ----------------
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("Ingresso")],
-        [KeyboardButton("Uscita")],
-        [KeyboardButton("Richiesta permessi")],
-        [KeyboardButton("Riepilogo")]
-    ], resize_keyboard=True
+        [KeyboardButton(text="Ingresso")],
+        [KeyboardButton(text="Uscita")],
+        [KeyboardButton(text="Richiesta permessi")],
+        [KeyboardButton(text="Riepilogo")]
+    ],
+    resize_keyboard=True
 )
 
 def build_calendar(year: int, month: int, phase: str):
@@ -202,7 +203,7 @@ async def start_handler(message: Message):
 @dp.message(F.text == "Ingresso")
 async def ingresso_start(message: Message, state: FSMContext):
     await state.set_state(RegistroForm.waiting_ingresso_location)
-    kb = ReplyKeyboardMarkup([[KeyboardButton("📍 Invia posizione", request_location=True)]], resize_keyboard=True)
+    kb = ReplyKeyboardMarkup([[KeyboardButton(text="📍 Invia posizione", request_location=True)]], resize_keyboard=True)
     await message.answer("Invia la tua posizione per registrare l'ingresso:", reply_markup=kb)
 
 @dp.message(RegistroForm.waiting_ingresso_location, F.location)
@@ -220,7 +221,7 @@ async def ingresso_location(message: Message, state: FSMContext):
 @dp.message(F.text == "Uscita")
 async def uscita_start(message: Message, state: FSMContext):
     await state.set_state(RegistroForm.waiting_uscita_location)
-    kb = ReplyKeyboardMarkup([[KeyboardButton("📍 Invia posizione", request_location=True)]], resize_keyboard=True)
+    kb = ReplyKeyboardMarkup([[KeyboardButton(text="📍 Invia posizione", request_location=True)]], resize_keyboard=True)
     await message.answer("Invia la tua posizione per registrare l'uscita:", reply_markup=kb)
 
 @dp.message(RegistroForm.waiting_uscita_location, F.location)
@@ -343,4 +344,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
