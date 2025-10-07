@@ -346,7 +346,7 @@ async def remind_ingresso():
             try:
                 name, user_id = user_str.split(" | ")
                 user_id = int(user_id)
-                await send_reminder(user_id, f"Ciao {name}, ricorda di registrare l'ingresso entro le 9:00!")
+                await send_reminder(user_id, f"Ciao {name}, ricorda di registrare l'ingresso")
             except Exception as e:
                 logging.error(f"Errore reminder ingresso per {user_str}: {e}")
     except Exception as e:
