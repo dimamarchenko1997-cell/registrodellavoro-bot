@@ -6,6 +6,7 @@ import csv
 import io
 from datetime import datetime
 from math import radians, sin, cos, sqrt, atan2
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.enums import ParseMode
@@ -13,6 +14,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+
 import aioschedule
 from dotenv import load_dotenv
 import logging
@@ -249,26 +251,42 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
     if len(parts) < 3:
         await cb.answer()
         return
+
     phase, kind = parts[1], parts[2]
+
     if kind == "nav":
         year, month, direction = int(parts[3]), int(parts[4]), parts[5]
-        month = month-1 if direction=="prev" else month+1
-        if month < 1: month, year = 12, year-1
-        if month > 12: month, year = 1, year+1
-        await cb.message.edit_reply_markup(build_calendar(year, month, phase))
+        if direction == "prev":
+            month -= 1
+            if month < 1:
+                month, year = 12, year - 1
+        else:
+            month += 1
+            if month > 12:
+                month, year = 1, year + 1
+        if cb.message:
+            await cb.message.edit_reply_markup(reply_markup=build_calendar(year, month, phase))
         await cb.answer()
         return
+
     if kind == "day":
         year, month, day = int(parts[3]), int(parts[4]), int(parts[5])
         selected = f"{year}-{month:02d}-{day:02d}"
         if phase == "start":
             await state.update_data(start_date=selected)
             await state.set_state(PermessiForm.waiting_for_end)
-            await cb.message.edit_text(f"📅 Inizio: {selected}\nSeleziona data di fine:", reply_markup=build_calendar(year, month, "end"))
+            if cb.message:
+                await cb.message.edit_text(
+                    f"📅 Inizio selezionato: {selected}\nSeleziona la data di fine:",
+                    reply_markup=build_calendar(year, month, "end")
+                )
         elif phase == "end":
             await state.update_data(end_date=selected)
             await state.set_state(PermessiForm.waiting_for_reason)
-            await cb.message.edit_text(f"📅 Fine: {selected}\nScrivi il motivo:")
+            if cb.message:
+                await cb.message.edit_text(
+                    f"📅 Fine selezionata: {selected}\nOra scrivi il motivo del permesso:"
+                )
         await cb.answer()
 
 @dp.message(PermessiForm.waiting_for_reason)
@@ -344,3 +362,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
