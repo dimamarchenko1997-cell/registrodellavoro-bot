@@ -2,8 +2,8 @@ import os
 import asyncio
 import calendar
 import json
-import csv  # Per CSV
-import io  # Per file in memoria
+import csv
+import io
 from datetime import datetime
 from math import radians, sin, cos, sqrt, atan2
 from aiogram import Bot, Dispatcher, F, types
@@ -13,24 +13,27 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 import aioschedule
 from dotenv import load_dotenv
 import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-import gspread  # Per Google Sheets
-from google.oauth2.service_account import Credentials  # Nuova autenticazione moderna
-import pytz  # Per timezone
+import gspread
+from google.oauth2.service_account import Credentials
+import pytz
 
 # ---------------- CONFIG ----------------
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN") or "PASTE_YOUR_TOKEN_HERE"
 SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")
 CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
-TIMEZONE = pytz.timezone('Europe/Rome')
+TIMEZONE = pytz.timezone("Europe/Rome")
+
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+# Dispatcher con MemoryStorage per FSM
+dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO)
 
 # ---------------- Google Sheets ----------------
@@ -39,17 +42,15 @@ def get_sheet(sheet_name="Registro"):
         raise ValueError("GOOGLE_CREDENTIALS non impostata!")
     try:
         credentials_dict = json.loads(CREDENTIALS_JSON)
-        # Se la private_key è stata salvata con 
-, trasformala in newline reale
-        if "private_key" in credentials_dict:
-            credentials_dict["private_key"] = credentials_dict["private_key"].replace("\n", "
-")
+        # Se la private_key è stata salvata in .env con '\n' (escape), sostituisci con newline reale
+        if "private_key" in credentials_dict and isinstance(credentials_dict["private_key"], str):
+            credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
         if "private_key" not in credentials_dict or not credentials_dict["private_key"].startswith("-----BEGIN PRIVATE KEY-----"):
             raise ValueError("Private_key malformata o mancante!")
     except json.JSONDecodeError as e:
         raise ValueError("JSON malformato: " + str(e))
 
-    scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
     client = gspread.authorize(creds)
     sheet = client.open_by_key(SHEET_ID).worksheet(sheet_name)
@@ -59,7 +60,7 @@ def get_sheet(sheet_name="Registro"):
 WORK_LOCATIONS = {
     "Ufficio Centrale": (45.6204762, 9.2401744),
     "Iveco Cornaredo": (45.480555, 9.034716),
-    "Iveco Vasto": (42.086621, 14.731960)
+    "Iveco Vasto": (42.086621, 14.731960),
 }
 MAX_DISTANCE_METERS = 200
 
@@ -302,17 +303,13 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
             await state.update_data(start_date=selected)
             await state.set_state(PermessiForm.waiting_for_end)
             await cb.message.edit_text(
-                f"📅 Inizio selezionato: {selected}
-Seleziona la data di fine:",
-                reply_markup=build_calendar(year, month, "end")
+                f"📅 Inizio selezionato: {selected}\nSeleziona la data di fine:",
+                reply_markup=build_calendar(year, month, "end"),
             )
         elif phase == "end":
             await state.update_data(end_date=selected)
             await state.set_state(PermessiForm.waiting_for_reason)
-            await cb.message.edit_text(
-                f"📅 Fine selezionata: {selected}
-Ora scrivi il motivo del permesso:"
-            )
+            await cb.message.edit_text(f"📅 Fine selezionata: {selected}\nOra scrivi il motivo del permesso:")
         await cb.answer()
 
 @dp.message(PermessiForm.waiting_for_reason)
@@ -334,10 +331,11 @@ async def riepilogo_handler(message: Message):
     if not riepilogo:
         await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
         return
-    buffer = io.BytesIO(riepilogo.getvalue().encode('utf-8'))
+    buffer = io.BytesIO(riepilogo.getvalue().encode("utf-8"))
     buffer.name = "riepilogo_registro.csv"
     buffer.seek(0)
-    await bot.send_document(message.chat.id, types.BufferedInputFile(buffer.read(), filename=buffer.name))
+    # usa InputFile con BytesIO
+    await bot.send_document(message.chat.id, types.InputFile(buffer, filename=buffer.name))
     await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
 
 # ---------------- Scheduler / Reminders ----------------
@@ -349,7 +347,6 @@ async def send_reminder(user_id: int, text: str):
         logging.error(f"Errore nell'invio reminder a {user_id}: {e}")
 
 async def remind_ingresso():
-    # Esegui solo nei giorni feriali (0=Monday ... 6=Sunday)
     weekday = datetime.now(TIMEZONE).weekday()
     if weekday >= 5:
         logging.info("Weekend: skip remind_ingresso")
@@ -362,9 +359,7 @@ async def remind_ingresso():
         if len(rows) < 2:
             logging.info("Nessun utente registrato nel foglio.")
             return
-        # tutti gli utenti (colonna 2) presenti nel foglio
         all_users = set(row[1] for row in rows[1:] if len(row) > 1 and row[1])
-        # utenti che hanno un ingresso oggi (colonna 3)
         registered_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
         missing_users = all_users - registered_today
         logging.info(f"Utenti totali: {len(all_users)}, registrati oggi: {len(registered_today)}, mancanti: {len(missing_users)}")
@@ -395,9 +390,7 @@ async def remind_uscita():
         if len(rows) < 2:
             logging.info("Nessun dato nel foglio.")
             return
-        # utenti che hanno fatto ingresso oggi
         all_users_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
-        # utenti che hanno già registrato uscita oggi (colonna 5)
         exited_today = set(row[1] for row in rows[1:] if len(row) > 4 and row[0] == today and row[4])
         missing_exit = all_users_today - exited_today
         logging.info(f"Ingressi oggi: {len(all_users_today)}, uscite registrate: {len(exited_today)}, mancanti: {len(missing_exit)}")
@@ -415,6 +408,14 @@ async def remind_uscita():
     except Exception as e:
         logging.error(f"Errore nel reminder uscita: {e}")
 
+# Test command per forzare i reminder (utile per debug)
+@dp.message(F.text == "/remindtest")
+async def remindtest_handler(message: Message):
+    await message.answer("Eseguo test reminder (ingresso + uscita).")
+    # creo task così non blocco l'handler
+    asyncio.create_task(remind_ingresso())
+    asyncio.create_task(remind_uscita())
+
 async def scheduler():
     while True:
         try:
@@ -425,9 +426,9 @@ async def scheduler():
 
 async def on_startup():
     init_sheets()
-    # Schedule giornalieri; remind_* controllerà il weekend internamente
-    aioschedule.every().day.at("08:30").do(remind_ingresso)
-    aioschedule.every().day.at("16:00").do(remind_uscita)
+    # use lambda + create_task to be robust rispetto a aioschedule/versioni
+    aioschedule.every().day.at("08:30").do(lambda: asyncio.create_task(remind_ingresso()))
+    aioschedule.every().day.at("16:00").do(lambda: asyncio.create_task(remind_uscita()))
     logging.info("Scheduler impostato: remind_ingresso 08:30, remind_uscita 16:00 (Europa/Rome)")
     asyncio.create_task(scheduler())
     logging.info("🚀 Bot avviato con scheduler per reminder ingresso/uscita")
@@ -460,4 +461,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
