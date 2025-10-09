@@ -41,8 +41,7 @@ def get_sheet(sheet_name="Registro"):
     try:
         credentials_dict = json.loads(CREDENTIALS_JSON)
         if "private_key" in credentials_dict:
-            credentials_dict["private_key"] = credentials_dict["private_key"].replace("\n", "
-")
+            credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
         if "private_key" not in credentials_dict or not credentials_dict["private_key"].startswith("-----BEGIN PRIVATE KEY-----"):
             raise ValueError("Private_key malformata o mancante!")
     except json.JSONDecodeError as e:
