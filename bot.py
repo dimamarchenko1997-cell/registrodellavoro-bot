@@ -22,7 +22,6 @@ from contextlib import asynccontextmanager
 import gspread  # Per Google Sheets
 from google.oauth2.service_account import Credentials  # Nuova autenticazione moderna
 import pytz  # Per timezone
-import io as _io
 
 # ---------------- CONFIG ----------------
 load_dotenv()
@@ -40,8 +39,11 @@ def get_sheet(sheet_name="Registro"):
         raise ValueError("GOOGLE_CREDENTIALS non impostata!")
     try:
         credentials_dict = json.loads(CREDENTIALS_JSON)
+        # Se la private_key è stata salvata con 
+, trasformala in newline reale
         if "private_key" in credentials_dict:
-            credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
+            credentials_dict["private_key"] = credentials_dict["private_key"].replace("\n", "
+")
         if "private_key" not in credentials_dict or not credentials_dict["private_key"].startswith("-----BEGIN PRIVATE KEY-----"):
             raise ValueError("Private_key malformata o mancante!")
     except json.JSONDecodeError as e:
@@ -299,14 +301,18 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
         if phase == "start":
             await state.update_data(start_date=selected)
             await state.set_state(PermessiForm.waiting_for_end)
-            await cb.message.edit_text(f"📅 Inizio selezionato: {selected}
+            await cb.message.edit_text(
+                f"📅 Inizio selezionato: {selected}
 Seleziona la data di fine:",
-                                       reply_markup=build_calendar(year, month, "end"))
+                reply_markup=build_calendar(year, month, "end")
+            )
         elif phase == "end":
             await state.update_data(end_date=selected)
             await state.set_state(PermessiForm.waiting_for_reason)
-            await cb.message.edit_text(f"📅 Fine selezionata: {selected}
-Ora scrivi il motivo del permesso:")
+            await cb.message.edit_text(
+                f"📅 Fine selezionata: {selected}
+Ora scrivi il motivo del permesso:"
+            )
         await cb.answer()
 
 @dp.message(PermessiForm.waiting_for_reason)
@@ -328,7 +334,7 @@ async def riepilogo_handler(message: Message):
     if not riepilogo:
         await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
         return
-    buffer = _io.BytesIO(riepilogo.getvalue().encode('utf-8'))
+    buffer = io.BytesIO(riepilogo.getvalue().encode('utf-8'))
     buffer.name = "riepilogo_registro.csv"
     buffer.seek(0)
     await bot.send_document(message.chat.id, types.BufferedInputFile(buffer.read(), filename=buffer.name))
@@ -454,3 +460,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
