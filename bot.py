@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 import gspread  # Per Google Sheets
 from google.oauth2.service_account import Credentials  # Nuova autenticazione moderna
 import pytz  # Per timezone
+import io as _io
 
 # ---------------- CONFIG ----------------
 load_dotenv()
@@ -40,7 +41,8 @@ def get_sheet(sheet_name="Registro"):
     try:
         credentials_dict = json.loads(CREDENTIALS_JSON)
         if "private_key" in credentials_dict:
-            credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
+            credentials_dict["private_key"] = credentials_dict["private_key"].replace("\n", "
+")
         if "private_key" not in credentials_dict or not credentials_dict["private_key"].startswith("-----BEGIN PRIVATE KEY-----"):
             raise ValueError("Private_key malformata o mancante!")
     except json.JSONDecodeError as e:
@@ -88,7 +90,7 @@ def save_ingresso(user: types.User, time, location_name):
         user_id = f"{user.full_name} | {user.id}"
         rows = sheet.get_all_values()
         for row in rows[1:]:
-            if row[0] == today and row[1] == user_id:
+            if len(row) > 1 and row[0] == today and row[1] == user_id:
                 logging.warning(f"Ingresso già registrato per {user_id} oggi.")
                 return False
         sheet.append_row([today, user_id, time_local, location_name, "", ""])
@@ -106,7 +108,7 @@ def save_uscita(user: types.User, time, location_name):
         user_id = f"{user.full_name} | {user.id}"
         rows = sheet.get_all_values()
         for i, row in enumerate(rows[1:], start=2):
-            if row[0] == today and row[1] == user_id and not row[4]:
+            if len(row) > 4 and row[0] == today and row[1] == user_id and not row[4]:
                 sheet.update_cell(i, 5, time_local)
                 sheet.update_cell(i, 6, location_name)
                 return True
@@ -141,7 +143,7 @@ async def get_riepilogo(user: types.User):
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
         user_id = f"{user.full_name} | {user.id}"
-        user_rows = [row for row in rows if row[1] == user_id]
+        user_rows = [row for row in rows if len(row) > 1 and row[1] == user_id]
         if not user_rows:
             return None
         output = io.StringIO()
@@ -191,7 +193,12 @@ def build_calendar(year: int, month: int, phase: str):
     kb.button(text=f"{mese_nome(month)} {year}", callback_data="ignore")
     for g in giorni:
         kb.button(text=g, callback_data="ignore")
+
+    # Forza sempre 6 settimane per mantenere dimensione costante
     weeks = calendar.monthcalendar(year, month)
+    while len(weeks) < 6:
+        weeks.append([0] * 7)
+
     for week in weeks:
         for day in week:
             if day == 0:
@@ -199,10 +206,12 @@ def build_calendar(year: int, month: int, phase: str):
             else:
                 text_day = f"🔵{day}" if day == today.day and month == today.month and year == today.year else str(day)
                 kb.button(text=text_day, callback_data=f"perm:{phase}:day:{year}:{month}:{day}")
+
     kb.button(text="◀️◀️◀️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")
     kb.button(text="▶️▶️▶️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")
-    adjust_sizes = [1, 7] + [7 for _ in weeks] + [2]
-    kb.adjust(*adjust_sizes)
+
+    # Imposta larghezze fisse: 1 (titolo), 7 (intestazione), 6x7 (settimane), 2 (frecce)
+    kb.adjust(1, 7, 7, 7, 7, 7, 7, 2)
     return kb.as_markup()
 
 # ---------------- Handlers ----------------
@@ -291,12 +300,14 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
         if phase == "start":
             await state.update_data(start_date=selected)
             await state.set_state(PermessiForm.waiting_for_end)
-            await cb.message.edit_text(f"📅 Inizio selezionato: {selected}\nSeleziona la data di fine:",
+            await cb.message.edit_text(f"📅 Inizio selezionato: {selected}
+Seleziona la data di fine:",
                                        reply_markup=build_calendar(year, month, "end"))
         elif phase == "end":
             await state.update_data(end_date=selected)
             await state.set_state(PermessiForm.waiting_for_reason)
-            await cb.message.edit_text(f"📅 Fine selezionata: {selected}\nOra scrivi il motivo del permesso:")
+            await cb.message.edit_text(f"📅 Fine selezionata: {selected}
+Ora scrivi il motivo del permesso:")
         await cb.answer()
 
 @dp.message(PermessiForm.waiting_for_reason)
@@ -318,55 +329,82 @@ async def riepilogo_handler(message: Message):
     if not riepilogo:
         await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
         return
-    buffer = io.BytesIO(riepilogo.getvalue().encode('utf-8'))
+    buffer = _io.BytesIO(riepilogo.getvalue().encode('utf-8'))
     buffer.name = "riepilogo_registro.csv"
     buffer.seek(0)
-    await bot.send_document(message.chat.id, types.BufferedInputFile(buffer.read(), filename="riepilogo_registro.csv"))
+    await bot.send_document(message.chat.id, types.BufferedInputFile(buffer.read(), filename=buffer.name))
     await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
 
-# ---------------- Scheduler ----------------
-async def send_reminder(user_id: int, message: str):
+# ---------------- Scheduler / Reminders ----------------
+async def send_reminder(user_id: int, text: str):
     try:
-        await bot.send_message(user_id, message)
+        await bot.send_message(user_id, text)
         logging.info(f"Reminder inviato a {user_id}")
     except Exception as e:
         logging.error(f"Errore nell'invio reminder a {user_id}: {e}")
 
 async def remind_ingresso():
+    # Esegui solo nei giorni feriali (0=Monday ... 6=Sunday)
+    weekday = datetime.now(TIMEZONE).weekday()
+    if weekday >= 5:
+        logging.info("Weekend: skip remind_ingresso")
+        return
     today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+    logging.info(f"Eseguo remind_ingresso per {today}")
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
         if len(rows) < 2:
+            logging.info("Nessun utente registrato nel foglio.")
             return
-        all_users = set(row[1] for row in rows[1:] if len(row) > 1)
+        # tutti gli utenti (colonna 2) presenti nel foglio
+        all_users = set(row[1] for row in rows[1:] if len(row) > 1 and row[1])
+        # utenti che hanno un ingresso oggi (colonna 3)
         registered_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
         missing_users = all_users - registered_today
+        logging.info(f"Utenti totali: {len(all_users)}, registrati oggi: {len(registered_today)}, mancanti: {len(missing_users)}")
         for user_str in missing_users:
             try:
-                name, user_id = user_str.split(" | ")
+                parts = user_str.rsplit(" | ", 1)
+                if len(parts) != 2:
+                    logging.warning(f"Formato user non valido: {user_str}")
+                    continue
+                name, user_id = parts[0], parts[1]
                 user_id = int(user_id)
-                await send_reminder(user_id, f"Ciao {name}, ricorda di registrare l'ingresso")
+                await send_reminder(user_id, f"Ciao {name}, ricorda di registrare l'ingresso 🔔")
             except Exception as e:
                 logging.error(f"Errore reminder ingresso per {user_str}: {e}")
     except Exception as e:
         logging.error(f"Errore nel reminder ingresso: {e}")
 
 async def remind_uscita():
+    weekday = datetime.now(TIMEZONE).weekday()
+    if weekday >= 5:
+        logging.info("Weekend: skip remind_uscita")
+        return
     today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
+    logging.info(f"Eseguo remind_uscita per {today}")
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
         if len(rows) < 2:
+            logging.info("Nessun dato nel foglio.")
             return
+        # utenti che hanno fatto ingresso oggi
         all_users_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
+        # utenti che hanno già registrato uscita oggi (colonna 5)
         exited_today = set(row[1] for row in rows[1:] if len(row) > 4 and row[0] == today and row[4])
         missing_exit = all_users_today - exited_today
+        logging.info(f"Ingressi oggi: {len(all_users_today)}, uscite registrate: {len(exited_today)}, mancanti: {len(missing_exit)}")
         for user_str in missing_exit:
             try:
-                name, user_id = user_str.split(" | ")
+                parts = user_str.rsplit(" | ", 1)
+                if len(parts) != 2:
+                    logging.warning(f"Formato user non valido: {user_str}")
+                    continue
+                name, user_id = parts[0], parts[1]
                 user_id = int(user_id)
-                await send_reminder(user_id, f"Ciao {name}, non dimenticare di registrare l'uscita!")
+                await send_reminder(user_id, f"Ciao {name}, non dimenticare di registrare l'uscita! 🔔")
             except Exception as e:
                 logging.error(f"Errore reminder uscita per {user_str}: {e}")
     except Exception as e:
@@ -374,15 +412,18 @@ async def remind_uscita():
 
 async def scheduler():
     while True:
-        await aioschedule.run_pending()
-        await asyncio.sleep(60)
+        try:
+            await aioschedule.run_pending()
+        except Exception as e:
+            logging.error(f"Errore in run_pending: {e}")
+        await asyncio.sleep(30)
 
 async def on_startup():
     init_sheets()
-    weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday"]
-    for day in weekdays:
-        getattr(aioschedule.every(), day).at("08:30").do(remind_ingresso)
-        getattr(aioschedule.every(), day).at("16:00").do(remind_uscita)
+    # Schedule giornalieri; remind_* controllerà il weekend internamente
+    aioschedule.every().day.at("08:30").do(remind_ingresso)
+    aioschedule.every().day.at("16:00").do(remind_uscita)
+    logging.info("Scheduler impostato: remind_ingresso 08:30, remind_uscita 16:00 (Europa/Rome)")
     asyncio.create_task(scheduler())
     logging.info("🚀 Bot avviato con scheduler per reminder ingresso/uscita")
 
@@ -414,4 +455,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
