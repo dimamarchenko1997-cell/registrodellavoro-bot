@@ -70,7 +70,7 @@ def get_sheet(sheet_name: str = "Registro") -> gspread.models.Worksheet:
 
     # Se la private_key contiene sequenze "\n" (escaped) le trasformiamo in newline reali
     if "private_key" in credentials_dict and isinstance(credentials_dict["private_key"], str):
-        credentials_dict["private_key"] = credentials_dict["private_key"].replace("\n", "
+        credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
 ")
 
     if "private_key" not in credentials_dict or not credentials_dict["private_key"].strip().startswith("-----BEGIN PRIVATE KEY-----"):
