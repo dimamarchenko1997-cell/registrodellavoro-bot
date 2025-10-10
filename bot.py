@@ -471,31 +471,32 @@ async def remind_uscita() -> None:
 
 
 # scheduler loop che gira in background
-async def scheduler_loop() -> None:
+async def scheduler_loop():
     global _last_ingresso_date, _last_uscita_date
-    logger.info("Scheduler loop avviato (controllo ogni 30s, timezone Europe/Rome)")
+    logging.info("Scheduler loop avviato...")
     while True:
         try:
             now = datetime.now(TIMEZONE)
             hhmm = now.strftime("%H:%M")
             today = now.date()
 
-            # Reminder ingresso (08:30)
+            # Reminder ingresso - 08:30
             if hhmm == "08:30" and _last_ingresso_date != today:
-                logger.info("Orario 08:30 raggiunto -> lancio remind_ingresso")
+                logging.info("Orario 08:30 Europe/Rome: lancio remind_ingresso")
                 asyncio.create_task(remind_ingresso())
                 _last_ingresso_date = today
 
-            # Reminder uscita (16:00)
+            # Reminder uscita - 16:00
             if hhmm == "16:00" and _last_uscita_date != today:
-                logger.info("Orario 16:00 raggiunto -> lancio remind_uscita")
+                logging.info("Orario 16:00 Europe/Rome: lancio remind_uscita")
                 asyncio.create_task(remind_uscita())
                 _last_uscita_date = today
 
         except Exception as e:
-            logger.exception("Errore nel scheduler loop: %s", e)
+            logging.error(f"Errore nel ciclo scheduler: {e}")
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(30)  # Controlla ogni 30 secondi
+
 
 
 # comando di test per forzare i reminder
