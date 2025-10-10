@@ -346,92 +346,75 @@ async def send_reminder(user_id: int, text: str):
     except Exception as e:
         logging.error(f"Errore nell'invio reminder a {user_id}: {e}")
 
+
 async def remind_ingresso():
     weekday = datetime.now(TIMEZONE).weekday()
     if weekday >= 5:
-        logging.info("Weekend: skip remind_ingresso")
         return
     today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-    logging.info(f"Eseguo remind_ingresso per {today}")
-    try:
-        sheet = get_sheet("Registro")
-        rows = sheet.get_all_values()
-        if len(rows) < 2:
-            logging.info("Nessun utente registrato nel foglio.")
-            return
-        all_users = set(row[1] for row in rows[1:] if len(row) > 1 and row[1])
-        registered_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
-        missing_users = all_users - registered_today
-        logging.info(f"Utenti totali: {len(all_users)}, registrati oggi: {len(registered_today)}, mancanti: {len(missing_users)}")
-        for user_str in missing_users:
-            try:
-                parts = user_str.rsplit(" | ", 1)
-                if len(parts) != 2:
-                    logging.warning(f"Formato user non valido: {user_str}")
-                    continue
-                name, user_id = parts[0], parts[1]
-                user_id = int(user_id)
-                await send_reminder(user_id, f"Ciao {name}, ricorda di registrare l'ingresso 🔔")
-            except Exception as e:
-                logging.error(f"Errore reminder ingresso per {user_str}: {e}")
-    except Exception as e:
-        logging.error(f"Errore nel reminder ingresso: {e}")
+    sheet = get_sheet("Registro")
+    rows = sheet.get_all_values()
+    if len(rows) < 2:
+        return
+    all_users = set(row[1] for row in rows[1:] if len(row) > 1 and row[1])
+    registered_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
+    missing_users = all_users - registered_today
+    for user_str in missing_users:
+        try:
+            name, user_id = user_str.rsplit(" | ", 1)
+            await send_reminder(int(user_id), f"Ciao {name}, ricorda di registrare l'ingresso 🔔")
+        except Exception as e:
+            logging.error(f"Reminder ingresso fallito per {user_str}: {e}")
+
 
 async def remind_uscita():
     weekday = datetime.now(TIMEZONE).weekday()
     if weekday >= 5:
-        logging.info("Weekend: skip remind_uscita")
         return
     today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-    logging.info(f"Eseguo remind_uscita per {today}")
-    try:
-        sheet = get_sheet("Registro")
-        rows = sheet.get_all_values()
-        if len(rows) < 2:
-            logging.info("Nessun dato nel foglio.")
-            return
-        all_users_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
-        exited_today = set(row[1] for row in rows[1:] if len(row) > 4 and row[0] == today and row[4])
-        missing_exit = all_users_today - exited_today
-        logging.info(f"Ingressi oggi: {len(all_users_today)}, uscite registrate: {len(exited_today)}, mancanti: {len(missing_exit)}")
-        for user_str in missing_exit:
-            try:
-                parts = user_str.rsplit(" | ", 1)
-                if len(parts) != 2:
-                    logging.warning(f"Formato user non valido: {user_str}")
-                    continue
-                name, user_id = parts[0], parts[1]
-                user_id = int(user_id)
-                await send_reminder(user_id, f"Ciao {name}, non dimenticare di registrare l'uscita! 🔔")
-            except Exception as e:
-                logging.error(f"Errore reminder uscita per {user_str}: {e}")
-    except Exception as e:
-        logging.error(f"Errore nel reminder uscita: {e}")
-
-# Test command per forzare i reminder (utile per debug)
-@dp.message(F.text == "/remindtest")
-async def remindtest_handler(message: Message):
-    await message.answer("Eseguo test reminder (ingresso + uscita).")
-    # creo task così non blocco l'handler
-    asyncio.create_task(remind_ingresso())
-    asyncio.create_task(remind_uscita())
-
-async def scheduler():
-    while True:
+    sheet = get_sheet("Registro")
+    rows = sheet.get_all_values()
+    if len(rows) < 2:
+        return
+    all_users_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
+    exited_today = set(row[1] for row in rows[1:] if len(row) > 4 and row[0] == today and row[4])
+    missing_exit = all_users_today - exited_today
+    for user_str in missing_exit:
         try:
-            await aioschedule.run_pending()
+            name, user_id = user_str.rsplit(" | ", 1)
+            await send_reminder(int(user_id), f"Ciao {name}, non dimenticare di registrare l'uscita! 🔔")
         except Exception as e:
-            logging.error(f"Errore in run_pending: {e}")
-        await asyncio.sleep(30)
+            logging.error(f"Reminder uscita fallito per {user_str}: {e}")
+
+
+async def scheduler_loop():
+    """Controlla continuamente l'orario locale e lancia i reminder agli orari stabiliti."""
+    global _last_ingresso_date, _last_uscita_date
+    while True:
+        now = datetime.now(TIMEZONE)
+        hhmm = now.strftime("%H:%M")
+        today = now.date()
+
+        # Reminder ingresso (08:30)
+        if hhmm == "19:45" and _last_ingresso_date != today:
+            logging.info("🔔 Lancio reminder ingresso")
+            asyncio.create_task(remind_ingresso())
+            _last_ingresso_date = today
+
+        # Reminder uscita (16:00)
+        if hhmm == "19:50" and _last_uscita_date != today:
+            logging.info("🔔 Lancio reminder uscita")
+            asyncio.create_task(remind_uscita())
+            _last_uscita_date = today
+
+        await asyncio.sleep(30)  # Controlla ogni 30 secondi
+
 
 async def on_startup():
     init_sheets()
-    # use lambda + create_task to be robust rispetto a aioschedule/versioni
-    aioschedule.every().day.at("08:30").do(lambda: asyncio.create_task(remind_ingresso()))
-    aioschedule.every().day.at("16:00").do(lambda: asyncio.create_task(remind_uscita()))
-    logging.info("Scheduler impostato: remind_ingresso 08:30, remind_uscita 16:00 (Europa/Rome)")
-    asyncio.create_task(scheduler())
-    logging.info("🚀 Bot avviato con scheduler per reminder ingresso/uscita")
+    asyncio.create_task(scheduler_loop())
+    logging.info("Scheduler avviato: controlla ogni 30s Europe/Rome")
+
 
 # ---------------- FastAPI Setup ----------------
 @asynccontextmanager
