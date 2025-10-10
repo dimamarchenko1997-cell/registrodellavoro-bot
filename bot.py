@@ -359,10 +359,9 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
             await state.update_data(start_date=selected)
             await state.set_state(PermessiForm.waiting_for_end)
             await cb.message.edit_text(
-                f"📅 Inizio selezionato: {selected}
-Seleziona la data di fine:",
-                reply_markup=build_calendar(year, month, "end"),
-            )
+    f"📅 Inizio selezionato: {selected}\nSeleziona la data di fine:",
+    reply_markup=build_calendar(year, month, "end"),
+)
         elif phase == "end":
             await state.update_data(end_date=selected)
             await state.set_state(PermessiForm.waiting_for_reason)
