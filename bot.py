@@ -207,10 +207,10 @@ def check_location(lat: float, lon: float) -> Optional[str]:
 # ---------------- Keyboards ----------------
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Ingresso")],
-        [KeyboardButton(text="Uscita")],
-        [KeyboardButton(text="Richiesta permessi")],
-        [KeyboardButton(text="Riepilogo")]
+        [KeyboardButton(text="🕓 Ingresso")],
+        [KeyboardButton(text="🚪 Uscita")],
+        [KeyboardButton(text="📝 Richiesta permessi")],
+        [KeyboardButton(text="📄 Riepilogo")]
     ],
     resize_keyboard=True
 )
