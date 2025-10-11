@@ -210,7 +210,8 @@ main_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="🕓 Ingresso")],
         [KeyboardButton(text="🚪 Uscita")],
         [KeyboardButton(text="📝 Richiesta permessi")],
-        [KeyboardButton(text="📄 Riepilogo")]
+        [KeyboardButton(text="📄 Riepilogo")],
+        [KeyboardButton(text="📘 Istruzioni Bot")],
     ],
     resize_keyboard=True
 )
@@ -373,6 +374,54 @@ async def riepilogo_handler(message: Message):
     buffer.seek(0)
     await bot.send_document(message.chat.id, types.InputFile(buffer, filename=buffer.name))
     await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
+
+@dp.message(F.text == "📘 Istruzioni Bot")
+async def istruzioni_handler(message: Message):
+    istruzioni_text = """
+<b>🔹 Come utilizzare il bot</b>
+<b>Avvio</b>
+Apri la chat con il bot e invia il comando /start.
+Ti verrà mostrato un menu con le seguenti opzioni:
+🕓 Ingresso
+🚪 Uscita
+📝 Richiesta permessi
+📄 Riepilogo
+<b>Registrazione ingresso</b>
+Premi “Ingresso”.
+Il bot ti chiederà di inviare la tua posizione (📍).
+Dopo l’invio, il sistema verifica che tu sia in una delle sedi autorizzate e registra data, ora e posizione.
+<b>Registrazione uscita</b>
+Premi “Uscita” e invia la posizione come sopra.
+Il bot aggiorna il tuo registro giornaliero con l’orario di uscita.
+<b>Richiesta permessi</b>
+Seleziona “Richiesta permessi” e scegli le date dal calendario.
+Inserisci il motivo: ferie, malattia, permesso, ecc.
+<b>Riepilogo personale</b>
+Puoi richiedere un riepilogo completo dei tuoi ingressi e uscite in formato CSV.
+
+<b>🔹 Funzionamento della geolocalizzazione</b>
+📍 Il bot NON traccia mai la posizione in automatico.
+La localizzazione viene utilizzata solo quando l’utente la invia manualmente durante la registrazione di ingresso o uscita.
+✅ Dati registrati:
+Data e ora dell’azione
+Nome e ID Telegram
+Luogo riconosciuto (es. Ufficio Centrale, Iveco Cornaredo…)
+Coordinate GPS (latitudine e longitudine)
+I dati servono esclusivamente a confermare la presenza sul posto di lavoro e a garantire la correttezza delle registrazioni.
+❌ Il bot non raccoglie posizione in background, non effettua tracciamenti continui e non utilizza i dati per altre finalità.
+
+<b>🔹 Tutela della privacy</b>
+Questo sistema è conforme al Regolamento Europeo GDPR (UE 2016/679) e rispetta i principi di:
+Trasparenza: i dipendenti sanno quali dati vengono raccolti e perché.
+Minimizzazione: vengono registrati solo i dati strettamente necessari.
+Limitazione temporale: i dati sono conservati solo per il periodo richiesto per la gestione presenze.
+Sicurezza: l’accesso ai dati su Google Sheets è riservato ai soli responsabili autorizzati.
+
+<b>🔹 Domande e assistenza</b>
+Per problemi tecnici o chiarimenti sulla privacy, contattare:
+📧 sserviceitalia@gmail.com - Shust Dmytro (3298333622)
+"""
+    await message.answer(istruzioni_text, reply_markup=main_kb)
 
 # ---------------- Scheduler / Reminders ----------------
 async def send_reminder(user_id: int, text: str) -> None:
