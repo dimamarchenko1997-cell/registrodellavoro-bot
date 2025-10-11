@@ -456,13 +456,13 @@ async def scheduler_loop() -> None:
 
                 # alle 08:30 Europe/Rome -> remind_ingresso
                 if hhmm == "08:30" and _last_ingresso_date != today_date:
-                    logger.info("Orario 22:00: lancio remind_ingresso")
+                    logger.info("Orario 08:30: lancio remind_ingresso")
                     asyncio.create_task(remind_ingresso())
                     _last_ingresso_date = today_date
 
                 # alle 16:00 Europe/Rome -> remind_uscita
                 if hhmm == "16:00" and _last_uscita_date != today_date:
-                    logger.info("Orario 22:10: lancio remind_uscita")
+                    logger.info("Orario 16:00: lancio remind_uscita")
                     asyncio.create_task(remind_uscita())
                     _last_uscita_date = today_date
 
