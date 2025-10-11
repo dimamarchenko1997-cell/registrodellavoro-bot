@@ -259,7 +259,7 @@ def build_calendar(year: int, month: int, phase: str):
 async def start_handler(message: Message):
     await message.answer("Benvenuto! Scegli un'opzione:", reply_markup=main_kb)
 
-@dp.message(F.text == "Ingresso")
+@dp.message(F.text == "🕓 Ingresso")
 async def ingresso_start(message: Message, state: FSMContext):
     await state.set_state(RegistroForm.waiting_ingresso_location)
     kb = ReplyKeyboardMarkup(
@@ -282,7 +282,7 @@ async def ingresso_location(message: Message, state: FSMContext):
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
     await state.clear()
 
-@dp.message(F.text == "Uscita")
+@dp.message(F.text == "🚪 Uscita")
 async def uscita_start(message: Message, state: FSMContext):
     await state.set_state(RegistroForm.waiting_uscita_location)
     kb = ReplyKeyboardMarkup(
@@ -305,7 +305,7 @@ async def uscita_location(message: Message, state: FSMContext):
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
     await state.clear()
 
-@dp.message(F.text == "Richiesta permessi")
+@dp.message(F.text == "📝 Richiesta permessi")
 async def permessi_start(message: Message, state: FSMContext):
     await state.set_state(PermessiForm.waiting_for_start)
     now = datetime.now(TIMEZONE)
@@ -362,7 +362,7 @@ async def permessi_reason(message: Message, state: FSMContext):
         await message.answer("❌ Errore nella registrazione del permesso.", reply_markup=main_kb)
     await state.clear()
 
-@dp.message(F.text == "Riepilogo")
+@dp.message(F.text == "📄 Riepilogo")
 async def riepilogo_handler(message: Message):
     riepilogo = await get_riepilogo(message.from_user)
     if not riepilogo:
@@ -455,13 +455,13 @@ async def scheduler_loop() -> None:
                 today_date = now.date()
 
                 # alle 08:30 Europe/Rome -> remind_ingresso
-                if hhmm == "22:00" and _last_ingresso_date != today_date:
+                if hhmm == "08:30" and _last_ingresso_date != today_date:
                     logger.info("Orario 22:00: lancio remind_ingresso")
                     asyncio.create_task(remind_ingresso())
                     _last_ingresso_date = today_date
 
                 # alle 16:00 Europe/Rome -> remind_uscita
-                if hhmm == "22:10" and _last_uscita_date != today_date:
+                if hhmm == "16:00" and _last_uscita_date != today_date:
                     logger.info("Orario 22:10: lancio remind_uscita")
                     asyncio.create_task(remind_uscita())
                     _last_uscita_date = today_date
