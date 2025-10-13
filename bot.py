@@ -96,10 +96,9 @@ WORK_LOCATIONS = {
     "Iveco Vasto": (42.086621, 14.731960),
     "Unicredit Bologna": (44.486511, 11.338797),
     "Pallazzo Gallo Osimo": (43.486247, 13.484761),
-    "PF Ponteggi Tolentino" (43.186848, 13.259663),
+    "PF Ponteggi Tolentino": (43.186848, 13.259663),
     "Unicredit Nocera Umbra": (43.116717, 12.790829),
     "Unicredit Deruta": (42.982390, 12.416994),
-
 }
 MAX_DISTANCE_METERS = 200
 
