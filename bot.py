@@ -10,13 +10,14 @@ import io
 import logging
 from datetime import datetime, date
 from math import radians, sin, cos, sqrt, atan2
-from typing import Optional, List, Any
+from typing import Optional
 
 from dotenv import load_dotenv
 import pytz
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import BufferedInputFile, FSInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
@@ -374,16 +375,25 @@ async def riepilogo_handler(message: Message):
     if not riepilogo:
         await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
         return
-    buffer = io.BytesIO(riepilogo.getvalue().encode("utf-8"))
-    buffer.name = "riepilogo_registro.csv"
+
+    # converti StringIO a BytesIO e invia con BufferedInputFile
+    csv_bytes = riepilogo.getvalue().encode("utf-8")
+    buffer = io.BytesIO(csv_bytes)
     buffer.seek(0)
-    await bot.send_document(message.chat.id, types.InputFile(buffer, filename=buffer.name))
-    await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
+    input_file = BufferedInputFile(buffer.getvalue(), filename="riepilogo_registro.csv")
+
+    try:
+        await bot.send_document(chat_id=message.chat.id, document=input_file)
+        await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
+    except Exception as e:
+        logger.exception("Errore invio riepilogo: %s", e)
+        await message.answer("❌ Errore nell'invio del riepilogo. Contatta l'amministratore.", reply_markup=main_kb)
+    finally:
+        buffer.close()
 
 @dp.message(F.text == "📘 Istruzioni Bot")
 async def istruzioni_handler(message: Message):
-    istruzioni_text = """
-<b>🔹 Come utilizzare il bot</b>
+    istruzioni_text = """<b>🔹 Come utilizzare il bot</b>
 <b>Avvio</b>
 Apri la chat con il bot e invia il comando /start.
 Ti verrà mostrato un menu con le seguenti opzioni:
