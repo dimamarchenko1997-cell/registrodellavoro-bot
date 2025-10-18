@@ -42,7 +42,7 @@ PORT = int(os.getenv("PORT", 8000))
 TIMEZONE = pytz.timezone("Europe/Rome")
 
 # --- ADMIN: sostituisci con i tuoi ID Telegram (int) ---
-ADMINS = {123456789}  # esempio: {3298333622}
+ADMINS = {614102287}  # esempio: {3298333622}
 
 # logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
