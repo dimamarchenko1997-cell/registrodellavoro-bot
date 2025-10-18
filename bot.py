@@ -126,11 +126,11 @@ def get_work_locations() -> Dict[str, Tuple[float, float]]:
                 locs[name] = (lat, lon)
         # se non ci sono righe in ZoneLavoro, usa statiche
         if not locs:
-            return WORK_LOCATIONS_STATIC.copy()
+            return WORK_LOCATIONS.copy()
         return locs
     except Exception as e:
         logger.warning("Impossibile leggere ZoneLavoro da Sheets, uso fallback statico: %s", e)
-        return WORK_LOCATIONS_STATIC.copy()
+        return WORK_LOCATIONS.copy()
 
 def save_new_zone(name: str, lat: float, lon: float) -> bool:
     """
@@ -142,6 +142,38 @@ def save_new_zone(name: str, lat: float, lon: float) -> bool:
         return True
     except Exception as e:
         logger.exception("Errore salvataggio zona: %s", e)
+        return False
+
+def update_zone_name(old_name: str, new_name: str) -> bool:
+    """
+    Aggiorna il nome di una zona esistente in ZoneLavoro.
+    """
+    try:
+        sheet = get_sheet("ZoneLavoro")
+        rows = sheet.get_all_values()
+        for i, row in enumerate(rows[1:], start=2):  # salta intestazione
+            if len(row) >= 3 and row[0] == old_name:
+                sheet.update_cell(i, 1, new_name)  # colonna A (1)
+                return True
+        return False
+    except Exception as e:
+        logger.exception("Errore aggiornamento zona: %s", e)
+        return False
+
+def delete_zone(name: str) -> bool:
+    """
+    Rimuove una zona da ZoneLavoro.
+    """
+    try:
+        sheet = get_sheet("ZoneLavoro")
+        rows = sheet.get_all_values()
+        for i, row in enumerate(rows[1:], start=2):  # salta intestazione
+            if len(row) >= 3 and row[0] == name:
+                sheet.delete_rows(i)
+                return True
+        return False
+    except Exception as e:
+        logger.exception("Errore rimozione zona: %s", e)
         return False
 
 # ---------------- FSM States ----------------
@@ -158,6 +190,9 @@ class PermessiForm(StatesGroup):
 class AddZoneForm(StatesGroup):
     waiting_for_location = State()
     waiting_for_name = State()
+
+class ZoneManagementForm(StatesGroup):
+    waiting_for_new_name = State()
 
 # ---------------- Sheets functions ----------------
 def init_sheets() -> None:
@@ -461,23 +496,23 @@ Ti verrà mostrato un menu con le seguenti opzioni:
 📝 Richiesta permessi
 📄 Riepilogo
 <b>Registrazione ingresso</b>
-Premi “Ingresso”.
+Premi "Ingresso".
 Il bot ti chiederà di inviare la tua posizione (📍).
-Dopo l’invio, il sistema verifica che tu sia in una delle sedi autorizzate e registra data, ora e posizione.
+Dopo l'invio, il sistema verifica che tu sia in una delle sedi autorizzate e registra data, ora e posizione.
 <b>Registrazione uscita</b>
-Premi “Uscita” e invia la posizione come sopra.
-Il bot aggiorna il tuo registro giornaliero con l’orario di uscita.
+Premi "Uscita" e invia la posizione come sopra.
+Il bot aggiorna il tuo registro giornaliero con l'orario di uscita.
 <b>Richiesta permessi</b>
-Seleziona “Richiesta permessi” e scegli le date dal calendario.
+Seleziona "Richiesta permessi" e scegli le date dal calendario.
 Inserisci il motivo: ferie, malattia, permesso, ecc.
 <b>Riepilogo personale</b>
 Puoi richiedere un riepilogo completo dei tuoi ingressi e uscite in formato CSV.
 
 <b>🔹 Funzionamento della geolocalizzazione</b>
 📍 Il bot NON traccia mai la posizione in automatico.
-La localizzazione viene utilizzata solo quando l’utente la invia manualmente durante la registrazione di ingresso o uscita.
+La localizzazione viene utilizzata solo quando l'utente la invia manualmente durante la registrazione di ingresso o uscita.
 ✅ Dati registrati:
-Data e ora dell’azione
+Data e ora dell'azione
 Nome e ID Telegram
 Luogo riconosciuto (es. Ufficio Centrale, Iveco Cornaredo…)
 Coordinate GPS (latitudine e longitudine)
@@ -489,7 +524,7 @@ Questo sistema è conforme al Regolamento Europeo GDPR (UE 2016/679) e rispetta 
 Trasparenza: i dipendenti sanno quali dati vengono raccolti e perché.
 Minimizzazione: vengono registrati solo i dati strettamente necessari.
 Limitazione temporale: i dati sono conservati solo per il periodo richiesto per la gestione presenze.
-Sicurezza: l’accesso ai dati su Google Sheets è riservato ai soli responsabili autorizzati.
+Sicurezza: l'accesso ai dati su Google Sheets è riservato ai soli responsabili autorizzati.
 
 <b>🔹 Domande e assistenza</b>
 Per problemi tecnici o chiarimenti sulla privacy, contattare:
@@ -533,6 +568,137 @@ async def addzone_name(message: Message, state: FSMContext):
         await message.answer(f"✅ Zona <b>{name}</b> aggiunta!\n📍 ({lat:.6f}, {lon:.6f})", reply_markup=main_kb)
     else:
         await message.answer("❌ Errore durante il salvataggio della zona.", reply_markup=main_kb)
+    await state.clear()
+
+# ---------------- /listzones (NEW) ----------------
+@dp.message(F.text == "/listzones")
+async def listzones_handler(message: Message):
+    if message.from_user.id not in ADMINS:
+        await message.answer("❌ Non hai i permessi per visualizzare le zone.")
+        return
+    
+    try:
+        work_locations = get_work_locations()
+        if not work_locations:
+            await message.answer("❌ Nessuna zona trovata.", reply_markup=main_kb)
+            return
+        
+        # Crea bottoni per ogni zona
+        kb = InlineKeyboardBuilder()
+        for zone_name in work_locations.keys():
+            kb.button(text=f"📍 {zone_name}", callback_data=f"zone_select:{zone_name}")
+        
+        kb.adjust(1)  # Un bottone per riga
+        
+        await message.answer(
+            "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla:",
+            reply_markup=kb.as_markup()
+        )
+    except Exception as e:
+        logger.exception("Errore listzones: %s", e)
+        await message.answer("❌ Errore nel caricamento delle zone.", reply_markup=main_kb)
+
+@dp.callback_query(F.data.startswith("zone_select:"))
+async def zone_select_handler(cb: CallbackQuery):
+    zone_name = cb.data.split(":", 1)[1]
+    
+    # Crea bottoni per modificare o rimuovere
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Modifica nome", callback_data=f"zone_edit:{zone_name}")
+    kb.button(text="🗑️ Rimuovi zona", callback_data=f"zone_delete:{zone_name}")
+    kb.button(text="🔙 Indietro", callback_data="zone_back")
+    kb.adjust(1)
+    
+    await cb.message.edit_text(
+        f"📍 <b>Zona selezionata:</b> {zone_name}\n\nCosa vuoi fare?",
+        reply_markup=kb.as_markup()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "zone_back")
+async def zone_back_handler(cb: CallbackQuery):
+    # Ricarica la lista delle zone
+    try:
+        work_locations = get_work_locations()
+        if not work_locations:
+            await cb.message.edit_text("❌ Nessuna zona trovata.")
+            return
+        
+        kb = InlineKeyboardBuilder()
+        for zone_name in work_locations.keys():
+            kb.button(text=f"📍 {zone_name}", callback_data=f"zone_select:{zone_name}")
+        
+        kb.adjust(1)
+        
+        await cb.message.edit_text(
+            "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla:",
+            reply_markup=kb.as_markup()
+        )
+    except Exception as e:
+        logger.exception("Errore zone_back: %s", e)
+        await cb.message.edit_text("❌ Errore nel caricamento delle zone.")
+    
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("zone_edit:"))
+async def zone_edit_handler(cb: CallbackQuery, state: FSMContext):
+    zone_name = cb.data.split(":", 1)[1]
+    await state.update_data(editing_zone=zone_name)
+    await state.set_state(ZoneManagementForm.waiting_for_new_name)
+    
+    await cb.message.edit_text(
+        f"✏️ <b>Modifica zona:</b> {zone_name}\n\nInserisci il nuovo nome per questa zona:"
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("zone_delete:"))
+async def zone_delete_handler(cb: CallbackQuery):
+    zone_name = cb.data.split(":", 1)[1]
+    
+    # Crea bottoni di conferma
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Conferma rimozione", callback_data=f"zone_confirm_delete:{zone_name}")
+    kb.button(text="❌ Annulla", callback_data=f"zone_select:{zone_name}")
+    kb.adjust(1)
+    
+    await cb.message.edit_text(
+        f"🗑️ <b>Conferma rimozione</b>\n\nSei sicuro di voler rimuovere la zona <b>{zone_name}</b>?\n\nQuesta azione non può essere annullata.",
+        reply_markup=kb.as_markup()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("zone_confirm_delete:"))
+async def zone_confirm_delete_handler(cb: CallbackQuery):
+    zone_name = cb.data.split(":", 1)[1]
+    
+    if delete_zone(zone_name):
+        await cb.message.edit_text(f"✅ Zona <b>{zone_name}</b> rimossa con successo!")
+    else:
+        await cb.message.edit_text(f"❌ Errore nella rimozione della zona <b>{zone_name}</b>.")
+    
+    await cb.answer()
+
+@dp.message(ZoneManagementForm.waiting_for_new_name)
+async def zone_new_name_handler(message: Message, state: FSMContext):
+    if message.text.strip().lower() == "annulla":
+        await state.clear()
+        await message.answer("❌ Operazione annullata.", reply_markup=main_kb)
+        return
+    
+    data = await state.get_data()
+    old_name = data.get("editing_zone")
+    new_name = message.text.strip()
+    
+    if not old_name or not new_name:
+        await message.answer("❌ Dati mancanti. Riprova con /listzones.", reply_markup=main_kb)
+        await state.clear()
+        return
+    
+    if update_zone_name(old_name, new_name):
+        await message.answer(f"✅ Zona rinominata con successo!\n\n<b>Prima:</b> {old_name}\n<b>Dopo:</b> {new_name}", reply_markup=main_kb)
+    else:
+        await message.answer(f"❌ Errore nella modifica della zona <b>{old_name}</b>.", reply_markup=main_kb)
+    
     await state.clear()
 
 # ---------------- Scheduler / Reminders ----------------
