@@ -41,7 +41,7 @@ CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")  # JSON string delle credenzi
 CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")  # oppure path a file .json
 PORT = int(os.getenv("PORT", 8000))
 TIMEZONE = pytz.timezone("Europe/Rome")
-ALLOWED_ADMINS = os.getenv("ALLOWED_ADMINS", "")  # CSV di user id autorizzati a gestire zone; vuoto = tutti
+ALLOWED_ADMINS = os.getenv("ALLOWED_ADMINS", "")  # CSV di user id autorizzati a gestire zone; se vuoto nessuno
 
 # logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -183,9 +183,9 @@ def _parse_admin_ids(env_value: str) -> set[int]:
 
 def user_can_manage_zones(user_id: int) -> bool:
     allowed_ids = _parse_admin_ids(ALLOWED_ADMINS)
-    # Se la lista è vuota, tutti sono autorizzati
+    # Se la lista è vuota, nessuno è autorizzato finché non viene configurato
     if not allowed_ids:
-        return True
+        return False
     return user_id in allowed_ids
 
 def load_zones_from_sheet() -> List[Tuple[str, float, float, float]]:
@@ -322,17 +322,17 @@ def check_location(lat: float, lon: float) -> Optional[str]:
     return None
 
 # ---------------- Keyboards ----------------
-main_kb = ReplyKeyboardMarkup(
-    keyboard=[
+def build_main_kb_for_user(user_id: int) -> ReplyKeyboardMarkup:
+    rows = [
         [KeyboardButton(text="🕓 Ingresso")],
         [KeyboardButton(text="🚪 Uscita")],
         [KeyboardButton(text="📝 Richiesta permessi")],
         [KeyboardButton(text="📄 Riepilogo")],
-        [KeyboardButton(text="➕ Aggiungi zona")],
-        [KeyboardButton(text="📘 Istruzioni Bot")],
-    ],
-    resize_keyboard=True
-)
+    ]
+    if user_can_manage_zones(user_id):
+        rows.append([KeyboardButton(text="➕ Aggiungi zona")])
+    rows.append([KeyboardButton(text="📘 Istruzioni Bot")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 # ---------------- Calendar builder ----------------
 def mese_nome(month: int) -> str:
@@ -376,7 +376,8 @@ def build_calendar(year: int, month: int, phase: str):
 # ---------------- Handlers ----------------
 @dp.message(F.text == "/start")
 async def start_handler(message: Message):
-    await message.answer("Benvenuto! Scegli un'opzione:", reply_markup=main_kb)
+    kb = build_main_kb_for_user(message.from_user.id)
+    await message.answer("Benvenuto! Scegli un'opzione:", reply_markup=kb)
 
 @dp.message(F.text == "🕓 Ingresso")
 async def ingresso_start(message: Message, state: FSMContext):
@@ -394,11 +395,11 @@ async def ingresso_location(message: Message, state: FSMContext):
     if location_name:
         now_local = datetime.now(TIMEZONE).strftime("%H:%M")
         if save_ingresso(message.from_user, now_local, location_name):
-            await message.answer("✅ Ingresso registrato!", reply_markup=main_kb)
+            await message.answer("✅ Ingresso registrato!", reply_markup=build_main_kb_for_user(message.from_user.id))
         else:
-            await message.answer("❌ Ingresso già registrato per oggi.", reply_markup=main_kb)
+            await message.answer("❌ Ingresso già registrato per oggi.", reply_markup=build_main_kb_for_user(message.from_user.id))
     else:
-        await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
+        await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=build_main_kb_for_user(message.from_user.id))
     await state.clear()
 
 @dp.message(F.text == "🚪 Uscita")
@@ -417,11 +418,11 @@ async def uscita_location(message: Message, state: FSMContext):
     if location_name:
         now_local = datetime.now(TIMEZONE).strftime("%H:%M")
         if save_uscita(message.from_user, now_local, location_name):
-            await message.answer("✅ Uscita registrata!", reply_markup=main_kb)
+            await message.answer("✅ Uscita registrata!", reply_markup=build_main_kb_for_user(message.from_user.id))
         else:
-            await message.answer("❌ Nessun ingresso trovato per oggi.", reply_markup=main_kb)
+            await message.answer("❌ Nessun ingresso trovato per oggi.", reply_markup=build_main_kb_for_user(message.from_user.id))
     else:
-        await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
+        await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=build_main_kb_for_user(message.from_user.id))
     await state.clear()
 
 @dp.message(F.text == "📝 Richiesta permessi")
@@ -476,16 +477,16 @@ async def permessi_reason(message: Message, state: FSMContext):
     end_date = data.get("end_date")
     reason = message.text or ""
     if save_permesso(message.from_user, start_date, end_date, reason):
-        await message.answer("✅ Permesso registrato!", reply_markup=main_kb)
+        await message.answer("✅ Permesso registrato!", reply_markup=build_main_kb_for_user(message.from_user.id))
     else:
-        await message.answer("❌ Errore nella registrazione del permesso.", reply_markup=main_kb)
+        await message.answer("❌ Errore nella registrazione del permesso.", reply_markup=build_main_kb_for_user(message.from_user.id))
     await state.clear()
 
 @dp.message(F.text == "📄 Riepilogo")
 async def riepilogo_handler(message: Message):
     riepilogo = await get_riepilogo(message.from_user)
     if not riepilogo:
-        await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
+        await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=build_main_kb_for_user(message.from_user.id))
         return
 
     # converti StringIO a BytesIO e invia con BufferedInputFile
@@ -496,10 +497,10 @@ async def riepilogo_handler(message: Message):
 
     try:
         await bot.send_document(chat_id=message.chat.id, document=input_file)
-        await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
+        await message.answer("✅ Riepilogo inviato!", reply_markup=build_main_kb_for_user(message.from_user.id))
     except Exception as e:
         logger.exception("Errore invio riepilogo: %s", e)
-        await message.answer("❌ Errore nell'invio del riepilogo. Contatta l'amministratore.", reply_markup=main_kb)
+        await message.answer("❌ Errore nell'invio del riepilogo. Contatta l'amministratore.", reply_markup=build_main_kb_for_user(message.from_user.id))
     finally:
         buffer.close()
 
@@ -548,7 +549,7 @@ Sicurezza: l’accesso ai dati su Google Sheets è riservato ai soli responsabil
 Per problemi tecnici o chiarimenti sulla privacy, contattare:
 📧 sserviceitalia@gmail.com - Shust Dmytro (3298333622)
 """
-    await message.answer(istruzioni_text, reply_markup=main_kb)
+    await message.answer(istruzioni_text, reply_markup=build_main_kb_for_user(message.from_user.id))
 
 # ---------------- Scheduler / Reminders ----------------
 async def send_reminder(user_id: int, text: str) -> None:
@@ -694,7 +695,7 @@ async def add_zone_wait_radius(message: Message, state: FSMContext):
     await state.set_state(ZonaForm.waiting_for_radius)
     await message.answer(
         f"Inserisci il raggio in metri (invio vuoto per {DEFAULT_ZONE_RADIUS} m):",
-        reply_markup=main_kb,
+        reply_markup=build_main_kb_for_user(message.from_user.id),
     )
 
 @dp.message(ZonaForm.waiting_for_location)
@@ -717,10 +718,10 @@ async def add_zone_finalize(message: Message, state: FSMContext):
     if add_zone(zone_name, lat, lon, radius):
         await message.answer(
             f"✅ Zona aggiunta: {zone_name}\nLat: {lat:.6f}, Lon: {lon:.6f}\nRaggio: {int(radius)} m",
-            reply_markup=main_kb,
+            reply_markup=build_main_kb_for_user(message.from_user.id),
         )
     else:
-        await message.answer("❌ Errore durante l'aggiunta della zona.", reply_markup=main_kb)
+        await message.answer("❌ Errore durante l'aggiunta della zona.", reply_markup=build_main_kb_for_user(message.from_user.id))
     await state.clear()
 
 # ---------------- FastAPI + lifecycle ----------------
