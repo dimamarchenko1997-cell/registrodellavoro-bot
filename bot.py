@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # bot.py - Telegram presence bot con Google Sheets, FastAPI webhook e scheduler interno
+# Versione completa con /addzone (solo admin) e lettura dinamica ZoneLavoro
 
 import os
 import asyncio
@@ -10,14 +11,13 @@ import io
 import logging
 from datetime import datetime, date
 from math import radians, sin, cos, sqrt, atan2
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 from dotenv import load_dotenv
 import pytz
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.types import BufferedInputFile, FSInputFile
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
@@ -41,6 +41,9 @@ CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")  # oppure path a file .j
 PORT = int(os.getenv("PORT", 8000))
 TIMEZONE = pytz.timezone("Europe/Rome")
 
+# --- ADMIN: sostituisci con i tuoi ID Telegram (int) ---
+ADMINS = {123456789}  # esempio: {3298333622}
+
 # logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -63,7 +66,6 @@ def get_sheet(sheet_name: str = "Registro") -> Worksheet:
     if not (CREDENTIALS_JSON or CREDENTIALS_FILE):
         raise ValueError("Devi impostare GOOGLE_CREDENTIALS (JSON string) o GOOGLE_CREDENTIALS_FILE (path).")
 
-    # Ottieni dict credenziali
     if CREDENTIALS_JSON:
         try:
             credentials_dict = json.loads(CREDENTIALS_JSON)
@@ -78,7 +80,6 @@ def get_sheet(sheet_name: str = "Registro") -> Worksheet:
         scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
     else:
-        # usa file JSON
         scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scope)
 
@@ -90,7 +91,8 @@ def get_sheet(sheet_name: str = "Registro") -> Worksheet:
         raise
     return sheet
 
-# ---------------- Costanti e luoghi ----------------
+# ---------------- Default Work Locations (fallback) ----------------
+# Se preferisci puoi lasciarlo vuoto e usare solo ZoneLavoro da Sheets.
 WORK_LOCATIONS = {
     "Ufficio Centrale": (45.6204762, 9.2401744),
     "Iveco Cornaredo": (45.480555, 9.034716),
@@ -103,6 +105,45 @@ WORK_LOCATIONS = {
 }
 MAX_DISTANCE_METERS = 200
 
+# ---------------- Zone from Sheets ----------------
+def get_work_locations() -> Dict[str, Tuple[float, float]]:
+    """
+    Legge il foglio 'ZoneLavoro' e restituisce un dict {nome: (lat, lon)}.
+    In caso di errore ritorna le WORK_LOCATIONS_STATIC come fallback.
+    """
+    try:
+        sheet = get_sheet("ZoneLavoro")
+        rows = sheet.get_all_values()
+        locs = {}
+        for row in rows[1:]:  # salta intestazione
+            if len(row) >= 3:
+                name = row[0]
+                try:
+                    lat = float(row[1])
+                    lon = float(row[2])
+                except ValueError:
+                    continue
+                locs[name] = (lat, lon)
+        # se non ci sono righe in ZoneLavoro, usa statiche
+        if not locs:
+            return WORK_LOCATIONS_STATIC.copy()
+        return locs
+    except Exception as e:
+        logger.warning("Impossibile leggere ZoneLavoro da Sheets, uso fallback statico: %s", e)
+        return WORK_LOCATIONS_STATIC.copy()
+
+def save_new_zone(name: str, lat: float, lon: float) -> bool:
+    """
+    Salva la nuova zona in ZoneLavoro (append row).
+    """
+    try:
+        sheet = get_sheet("ZoneLavoro")
+        sheet.append_row([name, str(lat), str(lon)])
+        return True
+    except Exception as e:
+        logger.exception("Errore salvataggio zona: %s", e)
+        return False
+
 # ---------------- FSM States ----------------
 class RegistroForm(StatesGroup):
     waiting_ingresso_location = State()
@@ -113,6 +154,11 @@ class PermessiForm(StatesGroup):
     waiting_for_end = State()
     waiting_for_reason = State()
 
+# --- NEW ---
+class AddZoneForm(StatesGroup):
+    waiting_for_location = State()
+    waiting_for_name = State()
+
 # ---------------- Sheets functions ----------------
 def init_sheets() -> None:
     try:
@@ -122,7 +168,15 @@ def init_sheets() -> None:
         sheet_perm = get_sheet("Permessi")
         if not sheet_perm.row_values(1):
             sheet_perm.append_row(["Data richiesta", "Utente", "Dal", "Al", "Motivo"])
-        logger.info("Sheets inizializzati (Registro, Permessi).")
+        # crea ZoneLavoro se non esiste o inizializza intestazione
+        try:
+            sheet_zone = get_sheet("ZoneLavoro")
+            if not sheet_zone.row_values(1):
+                sheet_zone.append_row(["Nome", "Latitudine", "Longitudine"])
+        except Exception:
+            # se non esiste, creazione dipende da permessi -- ignora
+            pass
+        logger.info("Sheets inizializzati (Registro, Permessi, ZoneLavoro se presente).")
     except Exception as e:
         logger.error("Errore init_sheets: %s", e)
 
@@ -205,7 +259,9 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 def check_location(lat: float, lon: float) -> Optional[str]:
-    for name, (wlat, wlon) in WORK_LOCATIONS.items():
+    # usa le zone caricate da Sheets (o fallback statico)
+    work_locations = get_work_locations()
+    for name, (wlat, wlon) in work_locations.items():
         if haversine(lat, lon, wlat, wlon) <= MAX_DISTANCE_METERS:
             return name
     return None
@@ -312,6 +368,7 @@ async def uscita_location(message: Message, state: FSMContext):
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
     await state.clear()
 
+# ---------------- Permessi ----------------
 @dp.message(F.text == "📝 Richiesta permessi")
 async def permessi_start(message: Message, state: FSMContext):
     await state.set_state(PermessiForm.waiting_for_start)
@@ -369,6 +426,7 @@ async def permessi_reason(message: Message, state: FSMContext):
         await message.answer("❌ Errore nella registrazione del permesso.", reply_markup=main_kb)
     await state.clear()
 
+# ---------------- Riepilogo ----------------
 @dp.message(F.text == "📄 Riepilogo")
 async def riepilogo_handler(message: Message):
     riepilogo = await get_riepilogo(message.from_user)
@@ -391,6 +449,7 @@ async def riepilogo_handler(message: Message):
     finally:
         buffer.close()
 
+# ---------------- Istruzioni ----------------
 @dp.message(F.text == "📘 Istruzioni Bot")
 async def istruzioni_handler(message: Message):
     istruzioni_text = """<b>🔹 Come utilizzare il bot</b>
@@ -437,6 +496,44 @@ Per problemi tecnici o chiarimenti sulla privacy, contattare:
 📧 sserviceitalia@gmail.com - Shust Dmytro (3298333622)
 """
     await message.answer(istruzioni_text, reply_markup=main_kb)
+
+# ---------------- /addzone (NEW) ----------------
+@dp.message(F.text == "/addzone")
+async def addzone_start(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMINS:
+        await message.answer("❌ Non hai i permessi per aggiungere zone.")
+        return
+    await state.set_state(AddZoneForm.waiting_for_location)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
+        resize_keyboard=True
+    )
+    await message.answer("📍 Invia la posizione della nuova zona di lavoro:", reply_markup=kb)
+
+@dp.message(AddZoneForm.waiting_for_location, F.location)
+async def addzone_location(message: Message, state: FSMContext):
+    await state.update_data(lat=message.location.latitude, lon=message.location.longitude)
+    await state.set_state(AddZoneForm.waiting_for_name)
+    await message.answer("✏️ Inserisci il nome della nuova zona (oppure scrivi Annulla per abortire):")
+
+@dp.message(AddZoneForm.waiting_for_name)
+async def addzone_name(message: Message, state: FSMContext):
+    if message.text.strip().lower() == "annulla":
+        await state.clear()
+        await message.answer("❌ Operazione annullata.", reply_markup=main_kb)
+        return
+    data = await state.get_data()
+    lat, lon = data.get("lat"), data.get("lon")
+    name = message.text.strip()
+    if lat is None or lon is None or not name:
+        await message.answer("❌ Dati mancanti. Riprova con /addzone.", reply_markup=main_kb)
+        await state.clear()
+        return
+    if save_new_zone(name, lat, lon):
+        await message.answer(f"✅ Zona <b>{name}</b> aggiunta!\n📍 ({lat:.6f}, {lon:.6f})", reply_markup=main_kb)
+    else:
+        await message.answer("❌ Errore durante il salvataggio della zona.", reply_markup=main_kb)
+    await state.clear()
 
 # ---------------- Scheduler / Reminders ----------------
 async def send_reminder(user_id: int, text: str) -> None:
@@ -550,7 +647,6 @@ async def remindtest_handler(message: Message):
 # ---------------- FastAPI + lifecycle ----------------
 async def on_startup() -> None:
     init_sheets()
-    # start scheduler in background
     asyncio.create_task(scheduler_loop())
     logger.info("On startup completato: scheduler avviato.")
 
