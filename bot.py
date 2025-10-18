@@ -10,7 +10,7 @@ import io
 import logging
 from datetime import datetime, date
 from math import radians, sin, cos, sqrt, atan2
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from dotenv import load_dotenv
 import pytz
@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager
 
 import gspread
 from gspread.worksheet import Worksheet
+from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
 # ---------------- CONFIG ----------------
@@ -40,6 +41,7 @@ CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")  # JSON string delle credenzi
 CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")  # oppure path a file .json
 PORT = int(os.getenv("PORT", 8000))
 TIMEZONE = pytz.timezone("Europe/Rome")
+ALLOWED_ADMINS = os.getenv("ALLOWED_ADMINS", "")  # CSV di user id autorizzati a gestire zone; se vuoto nessuno
 
 # logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -103,6 +105,13 @@ WORK_LOCATIONS = {
 }
 MAX_DISTANCE_METERS = 200
 
+# Default radius for dynamic zones if not provided
+DEFAULT_ZONE_RADIUS = int(os.getenv("DEFAULT_ZONE_RADIUS", str(MAX_DISTANCE_METERS)))
+
+# Zone sheet name and in-memory cache
+ZONES_SHEET_NAME = "Zone"
+_zones_cache: List[Tuple[str, float, float, float]] = []  # (name, lat, lon, radius_m)
+
 # ---------------- FSM States ----------------
 class RegistroForm(StatesGroup):
     waiting_ingresso_location = State()
@@ -122,9 +131,105 @@ def init_sheets() -> None:
         sheet_perm = get_sheet("Permessi")
         if not sheet_perm.row_values(1):
             sheet_perm.append_row(["Data richiesta", "Utente", "Dal", "Al", "Motivo"])
-        logger.info("Sheets inizializzati (Registro, Permessi).")
+        # Inizializza/crea sheet Zone se mancante
+        try:
+            sheet_zone = get_sheet(ZONES_SHEET_NAME)
+            if not sheet_zone.row_values(1):
+                sheet_zone.append_row(["Nome", "Latitudine", "Longitudine", "Raggio (m)"])
+        except WorksheetNotFound:
+            # crea worksheet "Zone" e imposta header
+            try:
+                if not (CREDENTIALS_JSON or CREDENTIALS_FILE):
+                    raise ValueError("Devi impostare credenziali Google per creare lo sheet Zone.")
+                if CREDENTIALS_JSON:
+                    credentials_dict = json.loads(CREDENTIALS_JSON)
+                    if "private_key" in credentials_dict and isinstance(credentials_dict["private_key"], str):
+                        credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
+                    scope = [
+                        "https://www.googleapis.com/auth/spreadsheets",
+                        "https://www.googleapis.com/auth/drive",
+                    ]
+                    creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
+                else:
+                    scope = [
+                        "https://www.googleapis.com/auth/spreadsheets",
+                        "https://www.googleapis.com/auth/drive",
+                    ]
+                    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scope)
+                client = gspread.authorize(creds)
+                sh = client.open_by_key(SHEET_ID)
+                sheet_zone = sh.add_worksheet(title=ZONES_SHEET_NAME, rows=100, cols=4)
+                sheet_zone.append_row(["Nome", "Latitudine", "Longitudine", "Raggio (m)"])
+                logger.info("Creato worksheet Zone con header.")
+            except Exception as ce:
+                logger.error("Errore creazione sheet Zone: %s", ce)
+        except Exception as e:
+            logger.error("Impossibile inizializzare lo sheet Zone: %s", e)
+        logger.info("Sheets inizializzati (Registro, Permessi, Zone).")
     except Exception as e:
         logger.error("Errore init_sheets: %s", e)
+
+def _parse_admin_ids(env_value: str) -> set[int]:
+    ids: set[int] = set()
+    for part in env_value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logger.warning("ID admin non numerico in ALLOWED_ADMINS: %s", part)
+    return ids
+
+def user_can_manage_zones(user_id: int) -> bool:
+    allowed_ids = _parse_admin_ids(ALLOWED_ADMINS)
+    # Se la lista è vuota, nessuno è autorizzato finché non viene configurato
+    if not allowed_ids:
+        return False
+    return user_id in allowed_ids
+
+def load_zones_from_sheet() -> List[Tuple[str, float, float, float]]:
+    try:
+        sheet = get_sheet(ZONES_SHEET_NAME)
+        rows = sheet.get_all_values()
+        result: List[Tuple[str, float, float, float]] = []
+        for row in rows[1:]:
+            if len(row) < 3:
+                continue
+            name = (row[0] or "").strip()
+            if not name:
+                continue
+            try:
+                lat = float(row[1])
+                lon = float(row[2])
+                radius = float(row[3]) if len(row) > 3 and row[3] else float(DEFAULT_ZONE_RADIUS)
+            except Exception:
+                logger.warning("Riga Zone non valida: %s", row)
+                continue
+            result.append((name, lat, lon, radius))
+        return result
+    except Exception as e:
+        logger.error("Errore caricando le Zone: %s", e)
+        return []
+
+def refresh_zones_cache() -> None:
+    global _zones_cache
+    _zones_cache = load_zones_from_sheet()
+    logger.info("Zone caricate in cache: %s", len(_zones_cache))
+
+def add_zone(name: str, lat: float, lon: float, radius_m: float) -> bool:
+    try:
+        if radius_m <= 0:
+            radius_m = float(DEFAULT_ZONE_RADIUS)
+        sheet = get_sheet(ZONES_SHEET_NAME)
+        sheet.append_row([name, lat, lon, radius_m])
+        # aggiorna cache in memoria
+        _zones_cache.append((name, float(lat), float(lon), float(radius_m)))
+        logger.info("Zona aggiunta: %s (%.6f, %.6f) r=%sm", name, lat, lon, radius_m)
+        return True
+    except Exception as e:
+        logger.exception("Errore aggiunta zona: %s", e)
+        return False
 
 def save_ingresso(user: types.User, time_str: str, location_name: str) -> bool:
     try:
@@ -205,22 +310,29 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 def check_location(lat: float, lon: float) -> Optional[str]:
+    # 1) Verifica zone dinamiche da Google Sheets
+    zones = _zones_cache if _zones_cache else []
+    for name, wlat, wlon, radius_m in zones:
+        if haversine(lat, lon, wlat, wlon) <= float(radius_m):
+            return name
+    # 2) Fallback alle zone statiche hardcoded
     for name, (wlat, wlon) in WORK_LOCATIONS.items():
         if haversine(lat, lon, wlat, wlon) <= MAX_DISTANCE_METERS:
             return name
     return None
 
 # ---------------- Keyboards ----------------
-main_kb = ReplyKeyboardMarkup(
-    keyboard=[
+def build_main_kb_for_user(user_id: int) -> ReplyKeyboardMarkup:
+    rows = [
         [KeyboardButton(text="🕓 Ingresso")],
         [KeyboardButton(text="🚪 Uscita")],
         [KeyboardButton(text="📝 Richiesta permessi")],
         [KeyboardButton(text="📄 Riepilogo")],
-        [KeyboardButton(text="📘 Istruzioni Bot")],
-    ],
-    resize_keyboard=True
-)
+    ]
+    if user_can_manage_zones(user_id):
+        rows.append([KeyboardButton(text="➕ Aggiungi zona")])
+    rows.append([KeyboardButton(text="📘 Istruzioni Bot")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 # ---------------- Calendar builder ----------------
 def mese_nome(month: int) -> str:
@@ -264,7 +376,8 @@ def build_calendar(year: int, month: int, phase: str):
 # ---------------- Handlers ----------------
 @dp.message(F.text == "/start")
 async def start_handler(message: Message):
-    await message.answer("Benvenuto! Scegli un'opzione:", reply_markup=main_kb)
+    kb = build_main_kb_for_user(message.from_user.id)
+    await message.answer("Benvenuto! Scegli un'opzione:", reply_markup=kb)
 
 @dp.message(F.text == "🕓 Ingresso")
 async def ingresso_start(message: Message, state: FSMContext):
@@ -282,11 +395,11 @@ async def ingresso_location(message: Message, state: FSMContext):
     if location_name:
         now_local = datetime.now(TIMEZONE).strftime("%H:%M")
         if save_ingresso(message.from_user, now_local, location_name):
-            await message.answer("✅ Ingresso registrato!", reply_markup=main_kb)
+            await message.answer("✅ Ingresso registrato!", reply_markup=build_main_kb_for_user(message.from_user.id))
         else:
-            await message.answer("❌ Ingresso già registrato per oggi.", reply_markup=main_kb)
+            await message.answer("❌ Ingresso già registrato per oggi.", reply_markup=build_main_kb_for_user(message.from_user.id))
     else:
-        await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
+        await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=build_main_kb_for_user(message.from_user.id))
     await state.clear()
 
 @dp.message(F.text == "🚪 Uscita")
@@ -305,11 +418,11 @@ async def uscita_location(message: Message, state: FSMContext):
     if location_name:
         now_local = datetime.now(TIMEZONE).strftime("%H:%M")
         if save_uscita(message.from_user, now_local, location_name):
-            await message.answer("✅ Uscita registrata!", reply_markup=main_kb)
+            await message.answer("✅ Uscita registrata!", reply_markup=build_main_kb_for_user(message.from_user.id))
         else:
-            await message.answer("❌ Nessun ingresso trovato per oggi.", reply_markup=main_kb)
+            await message.answer("❌ Nessun ingresso trovato per oggi.", reply_markup=build_main_kb_for_user(message.from_user.id))
     else:
-        await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
+        await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=build_main_kb_for_user(message.from_user.id))
     await state.clear()
 
 @dp.message(F.text == "📝 Richiesta permessi")
@@ -364,16 +477,16 @@ async def permessi_reason(message: Message, state: FSMContext):
     end_date = data.get("end_date")
     reason = message.text or ""
     if save_permesso(message.from_user, start_date, end_date, reason):
-        await message.answer("✅ Permesso registrato!", reply_markup=main_kb)
+        await message.answer("✅ Permesso registrato!", reply_markup=build_main_kb_for_user(message.from_user.id))
     else:
-        await message.answer("❌ Errore nella registrazione del permesso.", reply_markup=main_kb)
+        await message.answer("❌ Errore nella registrazione del permesso.", reply_markup=build_main_kb_for_user(message.from_user.id))
     await state.clear()
 
 @dp.message(F.text == "📄 Riepilogo")
 async def riepilogo_handler(message: Message):
     riepilogo = await get_riepilogo(message.from_user)
     if not riepilogo:
-        await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
+        await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=build_main_kb_for_user(message.from_user.id))
         return
 
     # converti StringIO a BytesIO e invia con BufferedInputFile
@@ -384,10 +497,10 @@ async def riepilogo_handler(message: Message):
 
     try:
         await bot.send_document(chat_id=message.chat.id, document=input_file)
-        await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
+        await message.answer("✅ Riepilogo inviato!", reply_markup=build_main_kb_for_user(message.from_user.id))
     except Exception as e:
         logger.exception("Errore invio riepilogo: %s", e)
-        await message.answer("❌ Errore nell'invio del riepilogo. Contatta l'amministratore.", reply_markup=main_kb)
+        await message.answer("❌ Errore nell'invio del riepilogo. Contatta l'amministratore.", reply_markup=build_main_kb_for_user(message.from_user.id))
     finally:
         buffer.close()
 
@@ -436,7 +549,7 @@ Sicurezza: l’accesso ai dati su Google Sheets è riservato ai soli responsabil
 Per problemi tecnici o chiarimenti sulla privacy, contattare:
 📧 sserviceitalia@gmail.com - Shust Dmytro (3298333622)
 """
-    await message.answer(istruzioni_text, reply_markup=main_kb)
+    await message.answer(istruzioni_text, reply_markup=build_main_kb_for_user(message.from_user.id))
 
 # ---------------- Scheduler / Reminders ----------------
 async def send_reminder(user_id: int, text: str) -> None:
@@ -547,9 +660,75 @@ async def remindtest_handler(message: Message):
     asyncio.create_task(remind_ingresso())
     asyncio.create_task(remind_uscita())
 
+# ---------------- Gestione Zone (FSM) ----------------
+class ZonaForm(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_location = State()
+    waiting_for_radius = State()
+
+@dp.message(F.text == "➕ Aggiungi zona")
+async def add_zone_start(message: Message, state: FSMContext):
+    if not user_can_manage_zones(message.from_user.id):
+        await message.answer("❌ Non sei autorizzato ad aggiungere zone.")
+        return
+    await state.set_state(ZonaForm.waiting_for_name)
+    await message.answer("Inserisci il nome della zona (es. Ufficio Centrale):")
+
+@dp.message(ZonaForm.waiting_for_name)
+async def add_zone_wait_location(message: Message, state: FSMContext):
+    zone_name = (message.text or "").strip()
+    if not zone_name:
+        await message.answer("Nome non valido. Riprova.")
+        return
+    await state.update_data(zone_name=zone_name)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
+        resize_keyboard=True
+    )
+    await state.set_state(ZonaForm.waiting_for_location)
+    await message.answer("Ora invia la posizione per la zona:", reply_markup=kb)
+
+@dp.message(ZonaForm.waiting_for_location, F.location)
+async def add_zone_wait_radius(message: Message, state: FSMContext):
+    loc = message.location
+    await state.update_data(lat=loc.latitude, lon=loc.longitude)
+    await state.set_state(ZonaForm.waiting_for_radius)
+    await message.answer(
+        f"Inserisci il raggio in metri (invio vuoto per {DEFAULT_ZONE_RADIUS} m):",
+        reply_markup=build_main_kb_for_user(message.from_user.id),
+    )
+
+@dp.message(ZonaForm.waiting_for_location)
+async def add_zone_wait_location_invalid(message: Message):
+    await message.answer("Per favore usa il pulsante '📍 Invia posizione' per inviare la posizione della zona.")
+
+@dp.message(ZonaForm.waiting_for_radius)
+async def add_zone_finalize(message: Message, state: FSMContext):
+    data = await state.get_data()
+    zone_name = data.get("zone_name", "")
+    lat = float(data.get("lat"))
+    lon = float(data.get("lon"))
+    radius_text = (message.text or "").strip()
+    try:
+        radius = float(radius_text) if radius_text else float(DEFAULT_ZONE_RADIUS)
+        if radius <= 0:
+            radius = float(DEFAULT_ZONE_RADIUS)
+    except Exception:
+        radius = float(DEFAULT_ZONE_RADIUS)
+    if add_zone(zone_name, lat, lon, radius):
+        await message.answer(
+            f"✅ Zona aggiunta: {zone_name}\nLat: {lat:.6f}, Lon: {lon:.6f}\nRaggio: {int(radius)} m",
+            reply_markup=build_main_kb_for_user(message.from_user.id),
+        )
+    else:
+        await message.answer("❌ Errore durante l'aggiunta della zona.", reply_markup=build_main_kb_for_user(message.from_user.id))
+    await state.clear()
+
 # ---------------- FastAPI + lifecycle ----------------
 async def on_startup() -> None:
     init_sheets()
+    # carica cache zone
+    refresh_zones_cache()
     # start scheduler in background
     asyncio.create_task(scheduler_loop())
     logger.info("On startup completato: scheduler avviato.")
