@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-# bot.py - Telegram presence bot con Google Sheets, FastAPI webhook e scheduler interno
-# Versione completa con /addzone (solo admin) e lettura dinamica ZoneLavoro
-
 import os
 import asyncio
 import calendar
@@ -644,8 +640,20 @@ async def zone_select_handler(cb: CallbackQuery):
 @dp.callback_query(F.data == "zone_add_new")
 async def zone_add_new_handler(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AddZoneForm.waiting_for_location)
+    
+    # Crea tastiera per inviare posizione
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
+        resize_keyboard=True
+    )
+    
     await cb.message.edit_text(
         "📍 <b>Aggiungi nuova zona</b>\n\nInvia la posizione della nuova zona di lavoro:"
+    )
+    await bot.send_message(
+        cb.message.chat.id,
+        "Usa il bottone qui sotto per inviare la posizione:",
+        reply_markup=kb
     )
     await cb.answer()
 
