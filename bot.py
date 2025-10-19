@@ -549,7 +549,14 @@ async def addzone_start(message: Message, state: FSMContext):
 async def addzone_location(message: Message, state: FSMContext):
     await state.update_data(lat=message.location.latitude, lon=message.location.longitude)
     await state.set_state(AddZoneForm.waiting_for_name)
-    await message.answer("✏️ Inserisci il nome della nuova zona (oppure scrivi Annulla per abortire):")
+    
+    # Crea tastiera per inviare posizione
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
+        resize_keyboard=True
+    )
+    
+    await message.answer("✏️ Inserisci il nome della nuova zona (oppure scrivi Annulla per abortire):", reply_markup=kb)
 
 @dp.message(AddZoneForm.waiting_for_name)
 async def addzone_name(message: Message, state: FSMContext):
@@ -565,7 +572,15 @@ async def addzone_name(message: Message, state: FSMContext):
         await state.clear()
         return
     if save_new_zone(name, lat, lon):
-        await message.answer(f"✅ Zona <b>{name}</b> aggiunta!\n📍 ({lat:.6f}, {lon:.6f})", reply_markup=main_kb)
+        # Crea bottone per tornare alla lista zone
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📋 Vedi tutte le zone", callback_data="zone_back")
+        kb.adjust(1)
+        
+        await message.answer(
+            f"✅ Zona <b>{name}</b> aggiunta!\n📍 ({lat:.6f}, {lon:.6f})",
+            reply_markup=kb.as_markup()
+        )
     else:
         await message.answer("❌ Errore durante il salvataggio della zona.", reply_markup=main_kb)
     await state.clear()
@@ -580,7 +595,15 @@ async def listzones_handler(message: Message):
     try:
         work_locations = get_work_locations()
         if not work_locations:
-            await message.answer("❌ Nessuna zona trovata.", reply_markup=main_kb)
+            # Crea bottone per aggiungere la prima zona
+            kb = InlineKeyboardBuilder()
+            kb.button(text="➕ Aggiungi prima zona", callback_data="zone_add_new")
+            kb.adjust(1)
+            
+            await message.answer(
+                "❌ Nessuna zona trovata.\n\nAggiungi la tua prima zona di lavoro:",
+                reply_markup=kb.as_markup()
+            )
             return
         
         # Crea bottoni per ogni zona
@@ -588,10 +611,13 @@ async def listzones_handler(message: Message):
         for zone_name in work_locations.keys():
             kb.button(text=f"📍 {zone_name}", callback_data=f"zone_select:{zone_name}")
         
+        # Aggiungi bottone per aggiungere nuova zona
+        kb.button(text="➕ Aggiungi zona", callback_data="zone_add_new")
+        
         kb.adjust(1)  # Un bottone per riga
         
         await message.answer(
-            "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla:",
+            "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla, oppure aggiungi una nuova zona:",
             reply_markup=kb.as_markup()
         )
     except Exception as e:
@@ -615,23 +641,42 @@ async def zone_select_handler(cb: CallbackQuery):
     )
     await cb.answer()
 
+@dp.callback_query(F.data == "zone_add_new")
+async def zone_add_new_handler(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AddZoneForm.waiting_for_location)
+    await cb.message.edit_text(
+        "📍 <b>Aggiungi nuova zona</b>\n\nInvia la posizione della nuova zona di lavoro:"
+    )
+    await cb.answer()
+
 @dp.callback_query(F.data == "zone_back")
 async def zone_back_handler(cb: CallbackQuery):
     # Ricarica la lista delle zone
     try:
         work_locations = get_work_locations()
         if not work_locations:
-            await cb.message.edit_text("❌ Nessuna zona trovata.")
+            # Crea bottone per aggiungere la prima zona
+            kb = InlineKeyboardBuilder()
+            kb.button(text="➕ Aggiungi prima zona", callback_data="zone_add_new")
+            kb.adjust(1)
+            
+            await cb.message.edit_text(
+                "❌ Nessuna zona trovata.\n\nAggiungi la tua prima zona di lavoro:",
+                reply_markup=kb.as_markup()
+            )
             return
         
         kb = InlineKeyboardBuilder()
         for zone_name in work_locations.keys():
             kb.button(text=f"📍 {zone_name}", callback_data=f"zone_select:{zone_name}")
         
+        # Aggiungi bottone per aggiungere nuova zona
+        kb.button(text="➕ Aggiungi zona", callback_data="zone_add_new")
+        
         kb.adjust(1)
         
         await cb.message.edit_text(
-            "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla:",
+            "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla, oppure aggiungi una nuova zona:",
             reply_markup=kb.as_markup()
         )
     except Exception as e:
