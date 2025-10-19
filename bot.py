@@ -90,8 +90,6 @@ def get_sheet(sheet_name: str = "Registro") -> Worksheet:
 # ---------------- Default Work Locations (fallback) ----------------
 # Se preferisci puoi lasciarlo vuoto e usare solo ZoneLavoro da Sheets.
 WORK_LOCATIONS = {
-    "Ufficio Centrale": (45.6204762, 9.2401744),
-    "Iveco Cornaredo": (45.480555, 9.034716),
     "Iveco Vasto": (42.086621, 14.731960),
     "Unicredit Bologna": (44.486511, 11.338797),
     "Pallazzo Gallo Osimo": (43.486247, 13.484761),
