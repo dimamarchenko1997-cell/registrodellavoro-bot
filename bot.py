@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# bot.py - Telegram presence bot con Google Sheets, FastAPI webhook e scheduler interno
+# Versione completa con /addzone (solo admin) e lettura dinamica ZoneLavoro
+
 import os
 import asyncio
 import calendar
@@ -27,12 +31,6 @@ from contextlib import asynccontextmanager
 import gspread
 from gspread.worksheet import Worksheet
 from google.oauth2.service_account import Credentials
-
-from aiogram import types
-from aiogram.types import FSInputFile
-from PIL import Image
-from pyzbar.pyzbar import decode
-import os
 
 # ---------------- CONFIG ----------------
 load_dotenv()
@@ -97,6 +95,13 @@ def get_sheet(sheet_name: str = "Registro") -> Worksheet:
 # Se preferisci puoi lasciarlo vuoto e usare solo ZoneLavoro da Sheets.
 WORK_LOCATIONS = {
     "Ufficio Centrale": (45.6204762, 9.2401744),
+    "Iveco Cornaredo": (45.480555, 9.034716),
+    "Iveco Vasto": (42.086621, 14.731960),
+    "Unicredit Bologna": (44.486511, 11.338797),
+    "Pallazzo Gallo Osimo": (43.486247, 13.484761),
+    "PF Ponteggi Tolentino": (43.186848, 13.259663),
+    "Unicredit Nocera Umbra": (43.116717, 12.790829),
+    "Unicredit Deruta": (42.982390, 12.416994),
 }
 MAX_DISTANCE_METERS = 200
 
@@ -189,6 +194,16 @@ class AddZoneForm(StatesGroup):
 class ZoneManagementForm(StatesGroup):
     waiting_for_new_name = State()
 
+class ScanBusForm(StatesGroup):
+    waiting_for_bus_id = State()
+    waiting_for_device = State()
+
+# ---------------- Device List ----------------
+DEVICE_LIST = [
+    "DVR", "CAM FRONT", "CAM 1", "CAM 2", "CAM 3", "CAM 4",
+    "CAM SX", "CAM DX", "CAM REAR", "PANIC BUTT", "C PAX 1", "C PAX 2"
+]
+
 # ---------------- Sheets functions ----------------
 def init_sheets() -> None:
     try:
@@ -206,7 +221,16 @@ def init_sheets() -> None:
         except Exception:
             # se non esiste, creazione dipende da permessi -- ignora
             pass
-        logger.info("Sheets inizializzati (Registro, Permessi, ZoneLavoro se presente).")
+        # crea Matricole se non esiste o inizializza intestazione
+        try:
+            sheet_matricole = get_sheet("Matricole")
+            if not sheet_matricole.row_values(1):
+                header = ["ID BUS"] + DEVICE_LIST
+                sheet_matricole.append_row(header)
+        except Exception:
+            # se non esiste, creazione dipende da permessi -- ignora
+            pass
+        logger.info("Sheets inizializzati (Registro, Permessi, ZoneLavoro, Matricole se presenti).")
     except Exception as e:
         logger.error("Errore init_sheets: %s", e)
 
@@ -281,6 +305,33 @@ async def get_riepilogo(user: types.User) -> Optional[io.StringIO]:
         logger.exception("Errore get_riepilogo: %s", e)
         return None
 
+def save_bus_id(bus_id: str) -> bool:
+    """
+    Salva l'ID BUS nel foglio Matricole e restituisce l'indice della riga.
+    """
+    try:
+        sheet = get_sheet("Matricole")
+        # Crea una riga con ID BUS e celle vuote per i dispositivi
+        row_values = [bus_id] + [""] * len(DEVICE_LIST)
+        sheet.append_row(row_values)
+        return True
+    except Exception as e:
+        logger.exception("Errore save_bus_id: %s", e)
+        return False
+
+def save_device_code(row_index: int, device_index: int, code: str) -> bool:
+    """
+    Salva il codice del dispositivo nella riga specificata.
+    """
+    try:
+        sheet = get_sheet("Matricole")
+        col_index = 1 + device_index  # colonna 1 = ID BUS, poi i dispositivi
+        sheet.update_cell(row_index, col_index + 1, code)  # +1 perché le righe partono da 1
+        return True
+    except Exception as e:
+        logger.exception("Errore save_device_code: %s", e)
+        return False
+
 # ---------------- Location utils ----------------
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000
@@ -296,6 +347,56 @@ def check_location(lat: float, lon: float) -> Optional[str]:
             return name
     return None
 
+# ---------------- Barcode utils ----------------
+async def process_barcode_image(file_path: str) -> Optional[str]:
+    """
+    Processa un'immagine per estrarre il codice a barre.
+    Restituisce il codice letto o None se non trovato.
+    """
+    try:
+        # Apri l'immagine
+        image = Image.open(file_path)
+        
+        # Converti in RGB se necessario (pyzbar funziona meglio con RGB)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Decodifica i codici a barre
+        barcodes = decode(image)
+        
+        if barcodes:
+            # Restituisci il primo codice trovato
+            barcode_data = barcodes[0].data.decode('utf-8')
+            logger.info("Barcode letto: %s", barcode_data)
+            return barcode_data
+        else:
+            logger.warning("Nessun barcode trovato nell'immagine")
+            return None
+            
+    except Exception as e:
+        logger.exception("Errore nella lettura del barcode: %s", e)
+        return None
+
+async def download_photo(bot: Bot, file_id: str) -> Optional[str]:
+    """
+    Scarica una foto da Telegram e restituisce il percorso del file locale.
+    """
+    try:
+        # Ottieni le informazioni sul file
+        file = await bot.get_file(file_id)
+        
+        # Crea un percorso temporaneo
+        temp_path = f"/tmp/photo_{file_id}.jpg"
+        
+        # Scarica il file
+        await bot.download_file(file.file_path, temp_path)
+        
+        return temp_path
+        
+    except Exception as e:
+        logger.exception("Errore nel download della foto: %s", e)
+        return None
+
 # ---------------- Keyboards ----------------
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
@@ -303,6 +404,7 @@ main_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="🚪 Uscita")],
         [KeyboardButton(text="📝 Richiesta permessi")],
         [KeyboardButton(text="📄 Riepilogo")],
+        [KeyboardButton(text="📷 Scannerizza matricole")],
         [KeyboardButton(text="📘 Istruzioni Bot")],
     ],
     resize_keyboard=True
@@ -503,6 +605,13 @@ Inserisci il motivo: ferie, malattia, permesso, ecc.
 <b>Riepilogo personale</b>
 Puoi richiedere un riepilogo completo dei tuoi ingressi e uscite in formato CSV.
 
+<b>Scannerizzazione matricole</b>
+Seleziona "Scannerizza matricole" per registrare le matricole dei dispositivi di un bus.
+Inserisci prima l'ID del bus, poi per ogni dispositivo puoi:
+- Inviare una foto con il barcode da scannerizzare
+- Inserire manualmente il codice della matricola
+Il sistema salverà automaticamente tutti i dati nel foglio "Matricole".
+
 <b>🔹 Funzionamento della geolocalizzazione</b>
 📍 Il bot NON traccia mai la posizione in automatico.
 La localizzazione viene utilizzata solo quando l'utente la invia manualmente durante la registrazione di ingresso o uscita.
@@ -526,70 +635,6 @@ Per problemi tecnici o chiarimenti sulla privacy, contattare:
 📧 sserviceitalia@gmail.com - Shust Dmytro (3298333622)
 """
     await message.answer(istruzioni_text, reply_markup=main_kb)
-
-
-class ScanBusForm(StatesGroup):
-    waiting_for_bus_id = State()
-    waiting_for_device = State()
-
-DEVICE_LIST = [
-    "DVR", "CAM FRONT", "CAM 1", "CAM 2", "CAM 3", "CAM 4",
-    "CAM SX", "CAM DX", "CAM REAR", "PANIC BUTT", "C PAX 1", "C PAX 2"
-]
-
-# === Comando /scan ===
-@dp.message(F.text == "/scan")
-async def scan_start(message: Message, state: FSMContext):
-    await state.set_state(ScanBusForm.waiting_for_bus_id)
-    await message.answer("🚌 Inserisci manualmente l'ID BUS da registrare:")
-
-# === Alternativa: bottone dal menu ===
-@dp.message(F.text == "📷 Scannerizza matricole")
-async def scan_button(message: Message, state: FSMContext):
-    await scan_start(message, state)
-
-# === Ricezione ID BUS ===
-@dp.message(ScanBusForm.waiting_for_bus_id)
-async def process_bus_id(message: Message, state: FSMContext):
-    bus_id = message.text.strip()
-
-    sheet = get_sheet("Matricole")
-    row_values = [bus_id] + [""] * len(DEVICE_LIST)
-    sheet.append_row(row_values)
-
-    new_row_index = len(sheet.get_all_values())
-    await state.update_data(row=new_row_index, current_device_index=0)
-    await state.set_state(ScanBusForm.waiting_for_device)
-
-    await message.answer(
-        f"✅ ID BUS <b>{bus_id}</b> registrato.\n\n"
-        f"Ora inserisci o scannerizza la matricola per: <b>{DEVICE_LIST[0]}</b>"
-    )
-
-# === Ricezione matricole dei dispositivi ===
-@dp.message(ScanBusForm.waiting_for_device)
-async def process_device_code(message: Message, state: FSMContext):
-    data = await state.get_data()
-    row_index = data["row"]
-    current_index = data["current_device_index"]
-
-    code = message.text.strip()
-    sheet = get_sheet("Matricole")
-    col_index = 1 + current_index  # colonna 1 = ID BUS
-    sheet.update_cell(row_index, col_index + 1, code)
-
-    next_index = current_index + 1
-    if next_index < len(DEVICE_LIST):
-        await state.update_data(current_device_index=next_index)
-        await message.answer(
-            f"📸 Inserisci o scannerizza la matricola per: <b>{DEVICE_LIST[next_index]}</b>"
-        )
-    else:
-        await state.clear()
-        await message.answer(
-            "✅ Tutte le matricole registrate con successo!\nTorno al menu principale.",
-            reply_markup=main_kb,
-        )
 
 # ---------------- /addzone (NEW) ----------------
 @dp.message(F.text == "/addzone")
@@ -816,6 +861,137 @@ async def zone_new_name_handler(message: Message, state: FSMContext):
         await message.answer(f"❌ Errore nella modifica della zona <b>{old_name}</b>.", reply_markup=main_kb)
     
     await state.clear()
+
+# ---------------- Barcode Scanning Handlers ----------------
+@dp.message(F.text == "/scan")
+async def scan_start(message: Message, state: FSMContext):
+    await state.set_state(ScanBusForm.waiting_for_bus_id)
+    await message.answer("🚌 Inserisci manualmente l'ID BUS da registrare:")
+
+@dp.message(F.text == "📷 Scannerizza matricole")
+async def scan_button(message: Message, state: FSMContext):
+    await scan_start(message, state)
+
+@dp.message(ScanBusForm.waiting_for_bus_id)
+async def process_bus_id(message: Message, state: FSMContext):
+    bus_id = message.text.strip()
+    
+    if not bus_id:
+        await message.answer("❌ ID BUS non valido. Riprova:")
+        return
+
+    if save_bus_id(bus_id):
+        # Ottieni l'indice della riga appena creata
+        try:
+            sheet = get_sheet("Matricole")
+            rows = sheet.get_all_values()
+            new_row_index = len(rows)  # La riga appena aggiunta è l'ultima
+        except Exception as e:
+            logger.exception("Errore ottenendo indice riga: %s", e)
+            await message.answer("❌ Errore nel salvataggio. Riprova.")
+            await state.clear()
+            return
+
+        await state.update_data(row=new_row_index, current_device_index=0)
+        await state.set_state(ScanBusForm.waiting_for_device)
+
+        await message.answer(
+            f"✅ ID BUS <b>{bus_id}</b> registrato.\n\n"
+            f"Ora inserisci o scannerizza la matricola per: <b>{DEVICE_LIST[0]}</b>\n\n"
+            f"📸 Puoi inviare una foto con il barcode o scrivere il codice manualmente."
+        )
+    else:
+        await message.answer("❌ Errore nel salvataggio dell'ID BUS. Riprova:")
+        await state.clear()
+
+@dp.message(ScanBusForm.waiting_for_device, F.photo)
+async def process_device_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    row_index = data["row"]
+    current_index = data["current_device_index"]
+    
+    try:
+        # Scarica la foto
+        photo = message.photo[-1]  # Prendi la foto con risoluzione più alta
+        file_path = await download_photo(bot, photo.file_id)
+        
+        if not file_path:
+            await message.answer("❌ Errore nel download della foto. Riprova:")
+            return
+        
+        # Processa il barcode
+        barcode_data = await process_barcode_image(file_path)
+        
+        # Pulisci il file temporaneo
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+        
+        if barcode_data:
+            # Salva il codice letto
+            if save_device_code(row_index, current_index, barcode_data):
+                await message.answer(f"✅ Barcode letto: <b>{barcode_data}</b>")
+            else:
+                await message.answer("❌ Errore nel salvataggio del codice. Riprova:")
+                return
+        else:
+            await message.answer(
+                "❌ Nessun barcode trovato nell'immagine.\n\n"
+                f"Inserisci manualmente la matricola per: <b>{DEVICE_LIST[current_index]}</b>"
+            )
+            return
+        
+        # Passa al dispositivo successivo
+        next_index = current_index + 1
+        if next_index < len(DEVICE_LIST):
+            await state.update_data(current_device_index=next_index)
+            await message.answer(
+                f"📸 Inserisci o scannerizza la matricola per: <b>{DEVICE_LIST[next_index]}</b>\n\n"
+                f"📸 Puoi inviare una foto con il barcode o scrivere il codice manualmente."
+            )
+        else:
+            await state.clear()
+            await message.answer(
+                "✅ Tutte le matricole registrate con successo!\nTorno al menu principale.",
+                reply_markup=main_kb,
+            )
+            
+    except Exception as e:
+        logger.exception("Errore process_device_photo: %s", e)
+        await message.answer("❌ Errore nella lettura del barcode. Riprova:")
+
+@dp.message(ScanBusForm.waiting_for_device, F.text)
+async def process_device_code(message: Message, state: FSMContext):
+    data = await state.get_data()
+    row_index = data["row"]
+    current_index = data["current_device_index"]
+
+    code = message.text.strip()
+    
+    if not code:
+        await message.answer("❌ Codice non valido. Riprova:")
+        return
+
+    if save_device_code(row_index, current_index, code):
+        await message.answer(f"✅ Codice <b>{code}</b> salvato per {DEVICE_LIST[current_index]}")
+    else:
+        await message.answer("❌ Errore nel salvataggio del codice. Riprova:")
+        return
+
+    next_index = current_index + 1
+    if next_index < len(DEVICE_LIST):
+        await state.update_data(current_device_index=next_index)
+        await message.answer(
+            f"📸 Inserisci o scannerizza la matricola per: <b>{DEVICE_LIST[next_index]}</b>\n\n"
+            f"📸 Puoi inviare una foto con il barcode o scrivere il codice manualmente."
+        )
+    else:
+        await state.clear()
+        await message.answer(
+            "✅ Tutte le matricole registrate con successo!\nTorno al menu principale.",
+            reply_markup=main_kb,
+        )
 
 # ---------------- Scheduler / Reminders ----------------
 async def send_reminder(user_id: int, text: str) -> None:
