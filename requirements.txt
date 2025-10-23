@@ -1,9 +1,19 @@
-aiogram==3.*
-fastapi
-uvicorn
-openpyxl
-python-dotenv
-aioschedule
-gunicorn
-gspread
-pytz
+# Core dependencies
+aiogram==3.2.0
+fastapi==0.104.1
+uvicorn==0.24.0
+python-dotenv==1.0.0
+pytz==2023.3
+
+# Google Sheets
+gspread==5.12.4
+google-auth==2.23.4
+google-auth-oauthlib==1.1.0
+google-auth-httplib2==0.1.1
+
+# Image processing and barcode reading
+Pillow==10.1.0
+pyzbar==0.1.9
+
+# Additional dependencies for barcode reading
+opencv-python==4.8.1.78
