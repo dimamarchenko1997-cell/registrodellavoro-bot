@@ -28,6 +28,12 @@ import gspread
 from gspread.worksheet import Worksheet
 from google.oauth2.service_account import Credentials
 
+from aiogram import types
+from aiogram.types import FSInputFile
+from PIL import Image
+from pyzbar.pyzbar import decode
+import os
+
 # ---------------- CONFIG ----------------
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")  # Telegram bot token
@@ -520,6 +526,70 @@ Per problemi tecnici o chiarimenti sulla privacy, contattare:
 📧 sserviceitalia@gmail.com - Shust Dmytro (3298333622)
 """
     await message.answer(istruzioni_text, reply_markup=main_kb)
+
+
+class ScanBusForm(StatesGroup):
+    waiting_for_bus_id = State()
+    waiting_for_device = State()
+
+DEVICE_LIST = [
+    "DVR", "CAM FRONT", "CAM 1", "CAM 2", "CAM 3", "CAM 4",
+    "CAM SX", "CAM DX", "CAM REAR", "PANIC BUTT", "C PAX 1", "C PAX 2"
+]
+
+# === Comando /scan ===
+@dp.message(F.text == "/scan")
+async def scan_start(message: Message, state: FSMContext):
+    await state.set_state(ScanBusForm.waiting_for_bus_id)
+    await message.answer("🚌 Inserisci manualmente l'ID BUS da registrare:")
+
+# === Alternativa: bottone dal menu ===
+@dp.message(F.text == "📷 Scannerizza matricole")
+async def scan_button(message: Message, state: FSMContext):
+    await scan_start(message, state)
+
+# === Ricezione ID BUS ===
+@dp.message(ScanBusForm.waiting_for_bus_id)
+async def process_bus_id(message: Message, state: FSMContext):
+    bus_id = message.text.strip()
+
+    sheet = get_sheet("Matricole")
+    row_values = [bus_id] + [""] * len(DEVICE_LIST)
+    sheet.append_row(row_values)
+
+    new_row_index = len(sheet.get_all_values())
+    await state.update_data(row=new_row_index, current_device_index=0)
+    await state.set_state(ScanBusForm.waiting_for_device)
+
+    await message.answer(
+        f"✅ ID BUS <b>{bus_id}</b> registrato.\n\n"
+        f"Ora inserisci o scannerizza la matricola per: <b>{DEVICE_LIST[0]}</b>"
+    )
+
+# === Ricezione matricole dei dispositivi ===
+@dp.message(ScanBusForm.waiting_for_device)
+async def process_device_code(message: Message, state: FSMContext):
+    data = await state.get_data()
+    row_index = data["row"]
+    current_index = data["current_device_index"]
+
+    code = message.text.strip()
+    sheet = get_sheet("Matricole")
+    col_index = 1 + current_index  # colonna 1 = ID BUS
+    sheet.update_cell(row_index, col_index + 1, code)
+
+    next_index = current_index + 1
+    if next_index < len(DEVICE_LIST):
+        await state.update_data(current_device_index=next_index)
+        await message.answer(
+            f"📸 Inserisci o scannerizza la matricola per: <b>{DEVICE_LIST[next_index]}</b>"
+        )
+    else:
+        await state.clear()
+        await message.answer(
+            "✅ Tutte le matricole registrate con successo!\nTorno al menu principale.",
+            reply_markup=main_kb,
+        )
 
 # ---------------- /addzone (NEW) ----------------
 @dp.message(F.text == "/addzone")
