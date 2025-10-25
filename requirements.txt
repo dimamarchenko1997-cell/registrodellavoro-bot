@@ -8,3 +8,4 @@ gunicorn
 gspread
 pytz
 Pillow
+pyzbar
