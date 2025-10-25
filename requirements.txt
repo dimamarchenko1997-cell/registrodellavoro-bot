@@ -7,3 +7,4 @@ aioschedule
 gunicorn
 gspread
 pytz
+Pillow
