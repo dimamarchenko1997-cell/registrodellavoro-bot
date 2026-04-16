@@ -28,39 +28,57 @@ import gspread
 from gspread.worksheet import Worksheet
 from google.oauth2.service_account import Credentials
 
-# ---------------- CONFIG ----------------
+# ============================================================
+# CONFIG
+# ============================================================
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")  # Telegram bot token
-SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")  # Google Sheets ID
-CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")  # JSON string delle credenziali (opzionale)
-CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")  # oppure path a file .json
+
+TOKEN = os.getenv("BOT_TOKEN")
+SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")
+CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
+CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")          # FIX #9 – es. https://tuo-dominio.com/webhook
 PORT = int(os.getenv("PORT", 8000))
 TIMEZONE = pytz.timezone("Europe/Rome")
 
-# --- ADMIN: sostituisci con i tuoi ID Telegram (int) ---
-ADMINS = {614102287}  # esempio: {3298333622}
+# FIX #8 – fail veloce se il token manca, prima di creare qualsiasi oggetto
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN non impostato nelle variabili d'ambiente.")
 
-# logging
+ADMINS = {614102287}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Bot + Dispatcher (FSM memory storage)
-bot = Bot(token=TOKEN or "", default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
-# Globals scheduler (servono per non inviare più volte nello stesso giorno)
 _last_ingresso_date: Optional[date] = None
 _last_uscita_date: Optional[date] = None
 
-# ---------------- Google Sheets helper ----------------
-def get_sheet(sheet_name: str = "Registro") -> Worksheet:
+
+# ============================================================
+# FIX #2 – Google Sheets: client con caching
+# ============================================================
+_gspread_client: Optional[gspread.Client] = None
+
+def _get_client() -> gspread.Client:
     """
-    Restituisce la worksheet richiesta. Supporta:
-      - GOOGLE_CREDENTIALS come stringa JSON (con \n escaped nella private_key)
-      - GOOGLE_CREDENTIALS_FILE -> path su filesystem
+    Restituisce il client gspread, creandolo solo la prima volta (caching).
+    Prima era ricreato ad ogni chiamata a get_sheet(), causando autenticazione
+    ripetuta e lentezza. Ora viene istanziato una volta sola.
     """
+    global _gspread_client
+    if _gspread_client is not None:
+        return _gspread_client
+
     if not (CREDENTIALS_JSON or CREDENTIALS_FILE):
-        raise ValueError("Devi impostare GOOGLE_CREDENTIALS (JSON string) o GOOGLE_CREDENTIALS_FILE (path).")
+        raise ValueError("Devi impostare GOOGLE_CREDENTIALS o GOOGLE_CREDENTIALS_FILE.")
+
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
 
     if CREDENTIALS_JSON:
         try:
@@ -68,143 +86,150 @@ def get_sheet(sheet_name: str = "Registro") -> Worksheet:
         except Exception as e:
             logger.exception("Errore parsing GOOGLE_CREDENTIALS: %s", e)
             raise
-
-        # converti sequenze "\\n" -> newline reale nella private_key
         if "private_key" in credentials_dict and isinstance(credentials_dict["private_key"], str):
             credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
-
-        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
     else:
-        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scope)
 
-    client = gspread.authorize(creds)
+    _gspread_client = gspread.authorize(creds)
+    return _gspread_client
+
+
+def get_sheet(sheet_name: str = "Registro") -> Worksheet:
+    """Restituisce la worksheet richiesta usando il client con caching."""
     try:
-        sheet = client.open_by_key(SHEET_ID).worksheet(sheet_name)
+        return _get_client().open_by_key(SHEET_ID).worksheet(sheet_name)
+    except gspread.exceptions.APIError as e:
+        # Se il token è scaduto (errore 401) azzera il client per forzare
+        # la riautenticazione al prossimo tentativo.
+        if e.response.status_code == 401:
+            global _gspread_client
+            _gspread_client = None
+            logger.warning("Token gspread scaduto, client resettato per riautenticazione.")
+        logger.exception("Errore aprendo il foglio '%s': %s", sheet_name, e)
+        raise
     except Exception as e:
         logger.exception("Errore aprendo il foglio '%s': %s", sheet_name, e)
         raise
-    return sheet
 
-# ---------------- Default Work Locations (fallback) ----------------
-# Se preferisci puoi lasciarlo vuoto e usare solo ZoneLavoro da Sheets.
+
+# ============================================================
+# FIX #3 – Caching work_locations con TTL (5 minuti)
+# ============================================================
+_work_locations_cache: Optional[Dict[str, Tuple[float, float]]] = None
+_work_locations_cache_time: Optional[datetime] = None
+_CACHE_TTL_SECONDS = 300  # 5 minuti
+
 WORK_LOCATIONS = {
     "Ufficio Centrale": (45.6204762, 9.2401744),
 }
 MAX_DISTANCE_METERS = 200
 
-# ---------------- Zone from Sheets ----------------
+
 def get_work_locations() -> Dict[str, Tuple[float, float]]:
     """
-    Legge il foglio 'ZoneLavoro' e restituisce un dict {nome: (lat, lon)}.
-    In caso di errore ritorna le WORK_LOCATIONS_STATIC come fallback.
+    Legge ZoneLavoro da Sheets con caching in memoria (TTL 5 minuti).
+    Prima questa funzione chiamava Sheets ad ogni check di posizione (ingresso/uscita),
+    sprecando quota API e aggiungendo centinaia di ms di latenza. Ora le zone vengono
+    recuperate al massimo ogni 5 minuti.
     """
+    global _work_locations_cache, _work_locations_cache_time
+
+    now = datetime.now(TIMEZONE)
+    cache_valid = (
+        _work_locations_cache is not None
+        and _work_locations_cache_time is not None
+        and (now - _work_locations_cache_time).total_seconds() < _CACHE_TTL_SECONDS
+    )
+    if cache_valid:
+        return _work_locations_cache
+
     try:
         sheet = get_sheet("ZoneLavoro")
         rows = sheet.get_all_values()
-        locs = {}
-        for row in rows[1:]:  # salta intestazione
+        locs: Dict[str, Tuple[float, float]] = {}
+        for row in rows[1:]:
             if len(row) >= 3:
-                name = row[0]
+                name = row[0].strip()
+                if not name:
+                    continue
                 try:
-                    lat = float(row[1])
-                    lon = float(row[2])
+                    lat, lon = float(row[1]), float(row[2])
                 except ValueError:
                     continue
                 locs[name] = (lat, lon)
-        # se non ci sono righe in ZoneLavoro, usa statiche
-        if not locs:
-            return WORK_LOCATIONS.copy()
-        return locs
+
+        result = locs if locs else WORK_LOCATIONS.copy()
+        _work_locations_cache = result
+        _work_locations_cache_time = now
+        return result
     except Exception as e:
-        logger.warning("Impossibile leggere ZoneLavoro da Sheets, uso fallback statico: %s", e)
+        logger.warning("Impossibile leggere ZoneLavoro, uso fallback statico: %s", e)
         return WORK_LOCATIONS.copy()
 
+
+def _invalidate_locations_cache() -> None:
+    """Invalida il cache zone dopo un'aggiunta, modifica o cancellazione."""
+    global _work_locations_cache, _work_locations_cache_time
+    _work_locations_cache = None
+    _work_locations_cache_time = None
+
+
 def save_new_zone(name: str, lat: float, lon: float) -> bool:
-    """
-    Salva la nuova zona in ZoneLavoro (append row).
-    """
     try:
         sheet = get_sheet("ZoneLavoro")
         sheet.append_row([name, str(lat), str(lon)])
+        _invalidate_locations_cache()  # FIX #3 – invalida cache dopo modifica
         return True
     except Exception as e:
         logger.exception("Errore salvataggio zona: %s", e)
         return False
 
+
 def update_zone_name(old_name: str, new_name: str) -> bool:
-    """
-    Aggiorna il nome di una zona esistente in ZoneLavoro.
-    """
     try:
         sheet = get_sheet("ZoneLavoro")
         rows = sheet.get_all_values()
-        for i, row in enumerate(rows[1:], start=2):  # salta intestazione
+        for i, row in enumerate(rows[1:], start=2):
             if len(row) >= 3 and row[0] == old_name:
-                sheet.update_cell(i, 1, new_name)  # colonna A (1)
+                sheet.update_cell(i, 1, new_name)
+                _invalidate_locations_cache()  # FIX #3
                 return True
         return False
     except Exception as e:
         logger.exception("Errore aggiornamento zona: %s", e)
         return False
 
+
 def delete_zone(name: str) -> bool:
-    """
-    Rimuove una zona da ZoneLavoro.
-    """
     try:
         sheet = get_sheet("ZoneLavoro")
         rows = sheet.get_all_values()
-        for i, row in enumerate(rows[1:], start=2):  # salta intestazione
+        for i, row in enumerate(rows[1:], start=2):
             if len(row) >= 3 and row[0] == name:
                 sheet.delete_rows(i)
+                _invalidate_locations_cache()  # FIX #3
                 return True
         return False
     except Exception as e:
         logger.exception("Errore rimozione zona: %s", e)
         return False
 
-# ---------------- FSM States ----------------
-class RegistroForm(StatesGroup):
-    waiting_ingresso_location = State()
-    waiting_uscita_location = State()
 
-class PermessiForm(StatesGroup):
-    waiting_for_start = State()
-    waiting_for_end = State()
-    waiting_for_reason = State()
+# ============================================================
+# FIX #1 – Wrapping delle chiamate sync in asyncio.to_thread
+# ============================================================
+# Tutte le funzioni che chiamano Google Sheets sono sincrone (bloccanti).
+# Chiamarle direttamente da handler async blocca l'event loop di aiogram,
+# impedendo di gestire altri messaggi mentre si aspetta la risposta di Sheets.
+# asyncio.to_thread le esegue in un thread separato senza bloccare il loop.
 
-# --- NEW ---
-class AddZoneForm(StatesGroup):
-    waiting_for_location = State()
-    waiting_for_name = State()
 
-class ZoneManagementForm(StatesGroup):
-    waiting_for_new_name = State()
+async def async_save_ingresso(user: types.User, time_str: str, location_name: str) -> bool:
+    return await asyncio.to_thread(_sync_save_ingresso, user, time_str, location_name)
 
-# ---------------- Sheets functions ----------------
-def init_sheets() -> None:
-    try:
-        sheet_reg = get_sheet("Registro")
-        if not sheet_reg.row_values(1):
-            sheet_reg.append_row(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
-        sheet_perm = get_sheet("Permessi")
-        if not sheet_perm.row_values(1):
-            sheet_perm.append_row(["Data richiesta", "Utente", "Dal", "Al", "Motivo"])
-        # crea ZoneLavoro se non esiste o inizializza intestazione
-        try:
-            sheet_zone = get_sheet("ZoneLavoro")
-            if not sheet_zone.row_values(1):
-                sheet_zone.append_row(["Nome", "Latitudine", "Longitudine"])
-        except Exception:
-            # se non esiste, creazione dipende da permessi -- ignora
-            pass
-        logger.info("Sheets inizializzati (Registro, Permessi, ZoneLavoro se presente).")
-    except Exception as e:
-        logger.error("Errore init_sheets: %s", e)
-
-def save_ingresso(user: types.User, time_str: str, location_name: str) -> bool:
+def _sync_save_ingresso(user: types.User, time_str: str, location_name: str) -> bool:
     try:
         sheet = get_sheet("Registro")
         now_local = datetime.now(TIMEZONE)
@@ -221,7 +246,11 @@ def save_ingresso(user: types.User, time_str: str, location_name: str) -> bool:
         logger.exception("Errore save_ingresso: %s", e)
         return False
 
-def save_uscita(user: types.User, time_str: str, location_name: str) -> bool:
+
+async def async_save_uscita(user: types.User, time_str: str, location_name: str) -> bool:
+    return await asyncio.to_thread(_sync_save_uscita, user, time_str, location_name)
+
+def _sync_save_uscita(user: types.User, time_str: str, location_name: str) -> bool:
     try:
         sheet = get_sheet("Registro")
         now_local = datetime.now(TIMEZONE)
@@ -229,10 +258,9 @@ def save_uscita(user: types.User, time_str: str, location_name: str) -> bool:
         user_id = f"{user.full_name} | {user.id}"
         rows = sheet.get_all_values()
         for i, row in enumerate(rows[1:], start=2):
-            # colonna 5 (index 4) è uscita ora
             if len(row) > 4 and row[0] == today and row[1] == user_id and not row[4]:
-                sheet.update_cell(i, 5, time_str)  # colonna E (5)
-                sheet.update_cell(i, 6, location_name)  # colonna F (6)
+                sheet.update_cell(i, 5, time_str)
+                sheet.update_cell(i, 6, location_name)
                 return True
         logger.warning("Nessun ingresso trovato per %s oggi.", user_id)
         return False
@@ -240,7 +268,11 @@ def save_uscita(user: types.User, time_str: str, location_name: str) -> bool:
         logger.exception("Errore save_uscita: %s", e)
         return False
 
-def save_permesso(user: types.User, start_date: str, end_date: str, reason: str) -> bool:
+
+async def async_save_permesso(user: types.User, start_date: str, end_date: str, reason: str) -> bool:
+    return await asyncio.to_thread(_sync_save_permesso, user, start_date, end_date, reason)
+
+def _sync_save_permesso(user: types.User, start_date: str, end_date: str, reason: str) -> bool:
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -257,7 +289,11 @@ def save_permesso(user: types.User, start_date: str, end_date: str, reason: str)
         logger.exception("Errore save_permesso: %s", e)
         return False
 
+
 async def get_riepilogo(user: types.User) -> Optional[io.StringIO]:
+    return await asyncio.to_thread(_sync_get_riepilogo, user)
+
+def _sync_get_riepilogo(user: types.User) -> Optional[io.StringIO]:
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
@@ -275,22 +311,47 @@ async def get_riepilogo(user: types.User) -> Optional[io.StringIO]:
         logger.exception("Errore get_riepilogo: %s", e)
         return None
 
-# ---------------- Location utils ----------------
+
+def init_sheets() -> None:
+    try:
+        sheet_reg = get_sheet("Registro")
+        if not sheet_reg.row_values(1):
+            sheet_reg.append_row(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
+        sheet_perm = get_sheet("Permessi")
+        if not sheet_perm.row_values(1):
+            sheet_perm.append_row(["Data richiesta", "Utente", "Dal", "Al", "Motivo"])
+        try:
+            sheet_zone = get_sheet("ZoneLavoro")
+            if not sheet_zone.row_values(1):
+                sheet_zone.append_row(["Nome", "Latitudine", "Longitudine"])
+        except Exception:
+            pass
+        logger.info("Sheets inizializzati.")
+    except Exception as e:
+        logger.error("Errore init_sheets: %s", e)
+
+
+# ============================================================
+# Location utils
+# ============================================================
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000
     dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
     a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
+
 def check_location(lat: float, lon: float) -> Optional[str]:
-    # usa le zone caricate da Sheets (o fallback statico)
     work_locations = get_work_locations()
     for name, (wlat, wlon) in work_locations.items():
         if haversine(lat, lon, wlat, wlon) <= MAX_DISTANCE_METERS:
             return name
     return None
 
-# ---------------- Keyboards ----------------
+
+# ============================================================
+# Keyboards
+# ============================================================
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🕓 Ingresso")],
@@ -299,28 +360,53 @@ main_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="📄 Riepilogo")],
         [KeyboardButton(text="📘 Istruzioni Bot")],
     ],
-    resize_keyboard=True
+    resize_keyboard=True,
 )
 
-# ---------------- Calendar builder ----------------
+location_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
+    resize_keyboard=True,
+)
+
+
+# ============================================================
+# FSM States
+# ============================================================
+class RegistroForm(StatesGroup):
+    waiting_ingresso_location = State()
+    waiting_uscita_location = State()
+
+class PermessiForm(StatesGroup):
+    waiting_for_start = State()
+    waiting_for_end = State()
+    waiting_for_reason = State()
+
+class AddZoneForm(StatesGroup):
+    waiting_for_location = State()
+    waiting_for_name = State()
+
+class ZoneManagementForm(StatesGroup):
+    waiting_for_new_name = State()
+
+
+# ============================================================
+# Calendar builder
+# ============================================================
 def mese_nome(month: int) -> str:
     mesi = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
             "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"]
     return mesi[month - 1]
+
 
 def build_calendar(year: int, month: int, phase: str):
     kb = InlineKeyboardBuilder()
     today = datetime.now(TIMEZONE)
     giorni = ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"]
 
-    # titolo
     kb.button(text=f"{mese_nome(month)} {year}", callback_data="ignore")
-
-    # giorni della settimana
     for g in giorni:
         kb.button(text=g, callback_data="ignore")
 
-    # numeri del mese - assicurati sempre 6 settimane per dimensione costante
     weeks = calendar.monthcalendar(year, month)
     while len(weeks) < 6:
         weeks.append([0] * 7)
@@ -330,74 +416,123 @@ def build_calendar(year: int, month: int, phase: str):
             if day == 0:
                 kb.button(text=" ", callback_data="ignore")
             else:
-                text_day = f"🔵{day}" if (day == today.day and month == today.month and year == today.year) else str(day)
+                text_day = (
+                    f"🔵{day}"
+                    if (day == today.day and month == today.month and year == today.year)
+                    else str(day)
+                )
                 kb.button(text=text_day, callback_data=f"perm:{phase}:day:{year}:{month}:{day}")
 
-    # frecce di navigazione (due bottoni)
     kb.button(text="◀️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")
     kb.button(text="▶️", callback_data=f"perm:{phase}:nav:{year}:{month}:next")
-
-    # costruisci righe: 1 (title), 7 (weekday names), 6 righe da 7 (mesi), 2 (frecce)
     kb.adjust(1, 7, *([7] * len(weeks)), 2)
     return kb.as_markup()
 
-# ---------------- Handlers ----------------
+
+# ============================================================
+# FIX #7 – Helper DRY per la lista zone (evita duplicazione)
+# ============================================================
+def _build_zones_markup(work_locations: Dict[str, Tuple[float, float]]):
+    """
+    Costruisce l'InlineKeyboard per la lista zone.
+    Era copiato identico in listzones_handler e zone_back_handler.
+    """
+    kb = InlineKeyboardBuilder()
+    for zone_name in work_locations.keys():
+        kb.button(text=f"📍 {zone_name}", callback_data=f"zone_select:{zone_name}")
+    kb.button(text="➕ Aggiungi zona", callback_data="zone_add_new")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def _show_zones_list(target) -> None:
+    """
+    Mostra la lista zone. `target` può essere un Message o un CallbackQuery.
+    Centralizza la logica che era duplicata in listzones_handler e zone_back_handler.
+    """
+    work_locations = await asyncio.to_thread(get_work_locations)
+    text_vuoto = "❌ Nessuna zona trovata.\n\nAggiungi la tua prima zona di lavoro:"
+    text_pieno = "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla, oppure aggiungi una nuova zona:"
+
+    if isinstance(target, CallbackQuery):
+        if not work_locations:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="➕ Aggiungi prima zona", callback_data="zone_add_new")
+            kb.adjust(1)
+            await target.message.edit_text(text_vuoto, reply_markup=kb.as_markup())
+        else:
+            await target.message.edit_text(text_pieno, reply_markup=_build_zones_markup(work_locations))
+    else:
+        if not work_locations:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="➕ Aggiungi prima zona", callback_data="zone_add_new")
+            kb.adjust(1)
+            await target.answer(text_vuoto, reply_markup=kb.as_markup())
+        else:
+            await target.answer(text_pieno, reply_markup=_build_zones_markup(work_locations))
+
+
+# ============================================================
+# Handlers – Ingresso / Uscita
+# ============================================================
 @dp.message(F.text == "/start")
 async def start_handler(message: Message):
     await message.answer("Benvenuto! Scegli un'opzione:", reply_markup=main_kb)
 
+
 @dp.message(F.text == "🕓 Ingresso")
 async def ingresso_start(message: Message, state: FSMContext):
     await state.set_state(RegistroForm.waiting_ingresso_location)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
-        resize_keyboard=True
-    )
-    await message.answer("Invia la tua posizione per registrare l'ingresso:", reply_markup=kb)
+    await message.answer("Invia la tua posizione per registrare l'ingresso:", reply_markup=location_kb)
+
 
 @dp.message(RegistroForm.waiting_ingresso_location, F.location)
 async def ingresso_location(message: Message, state: FSMContext):
+    await state.clear()
     loc = message.location
     location_name = check_location(loc.latitude, loc.longitude)
-    if location_name:
-        now_local = datetime.now(TIMEZONE).strftime("%H:%M")
-        if save_ingresso(message.from_user, now_local, location_name):
-            await message.answer("✅ Ingresso registrato!", reply_markup=main_kb)
-        else:
-            await message.answer("❌ Ingresso già registrato per oggi.", reply_markup=main_kb)
-    else:
+    if not location_name:
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
-    await state.clear()
+        return
+    now_local = datetime.now(TIMEZONE).strftime("%H:%M")
+    # FIX #1 – chiamata async
+    if await async_save_ingresso(message.from_user, now_local, location_name):
+        await message.answer("✅ Ingresso registrato!", reply_markup=main_kb)
+    else:
+        await message.answer("❌ Ingresso già registrato per oggi.", reply_markup=main_kb)
+
 
 @dp.message(F.text == "🚪 Uscita")
 async def uscita_start(message: Message, state: FSMContext):
     await state.set_state(RegistroForm.waiting_uscita_location)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
-        resize_keyboard=True
-    )
-    await message.answer("Invia la tua posizione per registrare l'uscita:", reply_markup=kb)
+    await message.answer("Invia la tua posizione per registrare l'uscita:", reply_markup=location_kb)
+
 
 @dp.message(RegistroForm.waiting_uscita_location, F.location)
 async def uscita_location(message: Message, state: FSMContext):
+    await state.clear()
     loc = message.location
     location_name = check_location(loc.latitude, loc.longitude)
-    if location_name:
-        now_local = datetime.now(TIMEZONE).strftime("%H:%M")
-        if save_uscita(message.from_user, now_local, location_name):
-            await message.answer("✅ Uscita registrata!", reply_markup=main_kb)
-        else:
-            await message.answer("❌ Nessun ingresso trovato per oggi.", reply_markup=main_kb)
-    else:
+    if not location_name:
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
-    await state.clear()
+        return
+    now_local = datetime.now(TIMEZONE).strftime("%H:%M")
+    # FIX #1 – chiamata async
+    if await async_save_uscita(message.from_user, now_local, location_name):
+        await message.answer("✅ Uscita registrata!", reply_markup=main_kb)
+    else:
+        await message.answer("❌ Nessun ingresso trovato per oggi.", reply_markup=main_kb)
 
-# ---------------- Permessi ----------------
+
+# ============================================================
+# Handlers – Permessi
+# ============================================================
 @dp.message(F.text == "📝 Richiesta permessi")
 async def permessi_start(message: Message, state: FSMContext):
     await state.set_state(PermessiForm.waiting_for_start)
     now = datetime.now(TIMEZONE)
     await message.answer("📅 Seleziona data di inizio:", reply_markup=build_calendar(now.year, now.month, "start"))
+
 
 @dp.callback_query(F.data.startswith("perm:"))
 async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
@@ -406,63 +541,69 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     phase, kind = parts[1], parts[2]
+
     if kind == "nav":
-        year = int(parts[3]); month = int(parts[4]); direction = parts[5]
+        year, month, direction = int(parts[3]), int(parts[4]), parts[5]
         if direction == "prev":
-            if month == 1:
-                month = 12; year -= 1
-            else:
-                month -= 1
+            month, year = (12, year - 1) if month == 1 else (month - 1, year)
         else:
-            if month == 12:
-                month = 1; year += 1
-            else:
-                month += 1
+            month, year = (1, year + 1) if month == 12 else (month + 1, year)
         await cb.message.edit_reply_markup(reply_markup=build_calendar(year, month, phase))
         await cb.answer()
         return
 
     if kind == "day":
-        year = int(parts[3]); month = int(parts[4]); day = int(parts[5])
+        year, month, day = int(parts[3]), int(parts[4]), int(parts[5])
         selected = f"{year}-{month:02d}-{day:02d}"
         if phase == "start":
             await state.update_data(start_date=selected)
             await state.set_state(PermessiForm.waiting_for_end)
             await cb.message.edit_text(
-                f"📅 Inizio selezionato: {selected}\nSeleziona la data di fine:",
+                f"📅 Inizio selezionato: <b>{selected}</b>\nSeleziona la data di fine:",
                 reply_markup=build_calendar(year, month, "end"),
             )
         elif phase == "end":
+            data = await state.get_data()
+            start_date = data.get("start_date", "")
+            # Validazione anticipata: fine non può precedere l'inizio
+            if selected < start_date:
+                await cb.answer("⚠️ La data di fine non può essere precedente all'inizio!", show_alert=True)
+                return
             await state.update_data(end_date=selected)
             await state.set_state(PermessiForm.waiting_for_reason)
-            await cb.message.edit_text(f"📅 Fine selezionata: {selected}\nOra scrivi il motivo del permesso:")
+            await cb.message.edit_text(
+                f"📅 Fine selezionata: <b>{selected}</b>\nOra scrivi il motivo del permesso:"
+            )
         await cb.answer()
+
 
 @dp.message(PermessiForm.waiting_for_reason)
 async def permessi_reason(message: Message, state: FSMContext):
     data = await state.get_data()
-    start_date = data.get("start_date")
-    end_date = data.get("end_date")
+    start_date = data.get("start_date", "")
+    end_date = data.get("end_date", "")
     reason = message.text or ""
-    if save_permesso(message.from_user, start_date, end_date, reason):
+    await state.clear()
+    # FIX #1 – chiamata async
+    if await async_save_permesso(message.from_user, start_date, end_date, reason):
         await message.answer("✅ Permesso registrato!", reply_markup=main_kb)
     else:
         await message.answer("❌ Errore nella registrazione del permesso.", reply_markup=main_kb)
-    await state.clear()
 
-# ---------------- Riepilogo ----------------
+
+# ============================================================
+# Handlers – Riepilogo
+# ============================================================
 @dp.message(F.text == "📄 Riepilogo")
 async def riepilogo_handler(message: Message):
+    # FIX #1 – già async (get_riepilogo usa asyncio.to_thread internamente)
     riepilogo = await get_riepilogo(message.from_user)
     if not riepilogo:
         await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
         return
 
-    # converti StringIO a BytesIO e invia con BufferedInputFile
     csv_bytes = riepilogo.getvalue().encode("utf-8")
-    buffer = io.BytesIO(csv_bytes)
-    buffer.seek(0)
-    input_file = BufferedInputFile(buffer.getvalue(), filename="riepilogo_registro.csv")
+    input_file = BufferedInputFile(csv_bytes, filename="riepilogo_registro.csv")
 
     try:
         await bot.send_document(chat_id=message.chat.id, document=input_file)
@@ -470,82 +611,71 @@ async def riepilogo_handler(message: Message):
     except Exception as e:
         logger.exception("Errore invio riepilogo: %s", e)
         await message.answer("❌ Errore nell'invio del riepilogo. Contatta l'amministratore.", reply_markup=main_kb)
-    finally:
-        buffer.close()
 
-# ---------------- Istruzioni ----------------
+
+# ============================================================
+# Handlers – Istruzioni
+# ============================================================
 @dp.message(F.text == "📘 Istruzioni Bot")
 async def istruzioni_handler(message: Message):
     istruzioni_text = """<b>🔹 Come utilizzare il bot</b>
 <b>Avvio</b>
 Apri la chat con il bot e invia il comando /start.
 Ti verrà mostrato un menu con le seguenti opzioni:
-🕓 Ingresso
-🚪 Uscita
-📝 Richiesta permessi
-📄 Riepilogo
+🕓 Ingresso | 🚪 Uscita | 📝 Richiesta permessi | 📄 Riepilogo
+
 <b>Registrazione ingresso</b>
-Premi "Ingresso".
-Il bot ti chiederà di inviare la tua posizione (📍).
-Dopo l'invio, il sistema verifica che tu sia in una delle sedi autorizzate e registra data, ora e posizione.
+Premi "Ingresso" → invia la posizione (📍).
+Il sistema verifica che tu sia in una sede autorizzata e registra data, ora e posizione.
+
 <b>Registrazione uscita</b>
 Premi "Uscita" e invia la posizione come sopra.
-Il bot aggiorna il tuo registro giornaliero con l'orario di uscita.
+Il bot aggiorna il registro giornaliero con l'orario di uscita.
+
 <b>Richiesta permessi</b>
-Seleziona "Richiesta permessi" e scegli le date dal calendario.
-Inserisci il motivo: ferie, malattia, permesso, ecc.
+Seleziona le date dal calendario e inserisci il motivo (ferie, malattia, permesso…).
+
 <b>Riepilogo personale</b>
-Puoi richiedere un riepilogo completo dei tuoi ingressi e uscite in formato CSV.
+Scarica un CSV completo dei tuoi ingressi e uscite.
 
-<b>🔹 Funzionamento della geolocalizzazione</b>
+<b>🔹 Geolocalizzazione</b>
 📍 Il bot NON traccia mai la posizione in automatico.
-La localizzazione viene utilizzata solo quando l'utente la invia manualmente durante la registrazione di ingresso o uscita.
-✅ Dati registrati:
-Data e ora dell'azione
-Nome e ID Telegram
-Luogo riconosciuto (es. Ufficio Centrale, Iveco Cornaredo…)
-Coordinate GPS (latitudine e longitudine)
-I dati servono esclusivamente a confermare la presenza sul posto di lavoro e a garantire la correttezza delle registrazioni.
-❌ Il bot non raccoglie posizione in background, non effettua tracciamenti continui e non utilizza i dati per altre finalità.
+La localizzazione è usata solo quando l'utente la invia manualmente.
+✅ Vengono registrati: data/ora, nome e ID Telegram, luogo riconosciuto.
+❌ Nessun tracciamento in background.
 
-<b>🔹 Tutela della privacy</b>
-Questo sistema è conforme al Regolamento Europeo GDPR (UE 2016/679) e rispetta i principi di:
-Trasparenza: i dipendenti sanno quali dati vengono raccolti e perché.
-Minimizzazione: vengono registrati solo i dati strettamente necessari.
-Limitazione temporale: i dati sono conservati solo per il periodo richiesto per la gestione presenze.
-Sicurezza: l'accesso ai dati su Google Sheets è riservato ai soli responsabili autorizzati.
+<b>🔹 Privacy (GDPR UE 2016/679)</b>
+Trasparenza · Minimizzazione · Limitazione temporale · Sicurezza
+L'accesso ai dati su Google Sheets è riservato ai responsabili autorizzati.
 
-<b>🔹 Domande e assistenza</b>
-Per problemi tecnici o chiarimenti sulla privacy, contattare:
-📧 sserviceitalia@gmail.com - Shust Dmytro (3298333622)
+<b>🔹 Assistenza</b>
+📧 sserviceitalia@gmail.com – Shust Dmytro (3298333622)
 """
     await message.answer(istruzioni_text, reply_markup=main_kb)
 
-# ---------------- /addzone (NEW) ----------------
+
+# ============================================================
+# Handlers – Gestione Zone (admin)
+# ============================================================
 @dp.message(F.text == "/addzone")
 async def addzone_start(message: Message, state: FSMContext):
     if message.from_user.id not in ADMINS:
         await message.answer("❌ Non hai i permessi per aggiungere zone.")
         return
     await state.set_state(AddZoneForm.waiting_for_location)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
-        resize_keyboard=True
-    )
-    await message.answer("📍 Invia la posizione della nuova zona di lavoro:", reply_markup=kb)
+    await message.answer("📍 Invia la posizione della nuova zona di lavoro:", reply_markup=location_kb)
+
 
 @dp.message(AddZoneForm.waiting_for_location, F.location)
 async def addzone_location(message: Message, state: FSMContext):
+    # FIX #6 – rimosso il re-invio del location_kb (non serve più dopo aver ricevuto la posizione)
     await state.update_data(lat=message.location.latitude, lon=message.location.longitude)
     await state.set_state(AddZoneForm.waiting_for_name)
-    
-    # Crea tastiera per inviare posizione
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
-        resize_keyboard=True
+    await message.answer(
+        "✏️ Inserisci il nome della nuova zona (o scrivi <b>Annulla</b> per abortire):",
+        reply_markup=main_kb,
     )
-    
-    await message.answer("✏️ Inserisci il nome della nuova zona (oppure scrivi Annulla per abortire):", reply_markup=kb)
+
 
 @dp.message(AddZoneForm.waiting_for_name)
 async def addzone_name(message: Message, state: FSMContext):
@@ -560,169 +690,106 @@ async def addzone_name(message: Message, state: FSMContext):
         await message.answer("❌ Dati mancanti. Riprova con /addzone.", reply_markup=main_kb)
         await state.clear()
         return
-    if save_new_zone(name, lat, lon):
-        # Crea bottone per tornare alla lista zone
+    # FIX #1 – chiamata async
+    if await asyncio.to_thread(save_new_zone, name, lat, lon):
         kb = InlineKeyboardBuilder()
         kb.button(text="📋 Vedi tutte le zone", callback_data="zone_back")
         kb.adjust(1)
-        
         await message.answer(
             f"✅ Zona <b>{name}</b> aggiunta!\n📍 ({lat:.6f}, {lon:.6f})",
-            reply_markup=kb.as_markup()
+            reply_markup=kb.as_markup(),
         )
     else:
         await message.answer("❌ Errore durante il salvataggio della zona.", reply_markup=main_kb)
     await state.clear()
 
-# ---------------- /listzones (NEW) ----------------
+
 @dp.message(F.text == "/listzones")
 async def listzones_handler(message: Message):
     if message.from_user.id not in ADMINS:
         await message.answer("❌ Non hai i permessi per visualizzare le zone.")
         return
-    
     try:
-        work_locations = get_work_locations()
-        if not work_locations:
-            # Crea bottone per aggiungere la prima zona
-            kb = InlineKeyboardBuilder()
-            kb.button(text="➕ Aggiungi prima zona", callback_data="zone_add_new")
-            kb.adjust(1)
-            
-            await message.answer(
-                "❌ Nessuna zona trovata.\n\nAggiungi la tua prima zona di lavoro:",
-                reply_markup=kb.as_markup()
-            )
-            return
-        
-        # Crea bottoni per ogni zona
-        kb = InlineKeyboardBuilder()
-        for zone_name in work_locations.keys():
-            kb.button(text=f"📍 {zone_name}", callback_data=f"zone_select:{zone_name}")
-        
-        # Aggiungi bottone per aggiungere nuova zona
-        kb.button(text="➕ Aggiungi zona", callback_data="zone_add_new")
-        
-        kb.adjust(1)  # Un bottone per riga
-        
-        await message.answer(
-            "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla, oppure aggiungi una nuova zona:",
-            reply_markup=kb.as_markup()
-        )
+        await _show_zones_list(message)  # FIX #7 – usa helper DRY
     except Exception as e:
         logger.exception("Errore listzones: %s", e)
         await message.answer("❌ Errore nel caricamento delle zone.", reply_markup=main_kb)
 
+
 @dp.callback_query(F.data.startswith("zone_select:"))
 async def zone_select_handler(cb: CallbackQuery):
     zone_name = cb.data.split(":", 1)[1]
-    
-    # Crea bottoni per modificare o rimuovere
     kb = InlineKeyboardBuilder()
     kb.button(text="✏️ Modifica nome", callback_data=f"zone_edit:{zone_name}")
     kb.button(text="🗑️ Rimuovi zona", callback_data=f"zone_delete:{zone_name}")
     kb.button(text="🔙 Indietro", callback_data="zone_back")
     kb.adjust(1)
-    
     await cb.message.edit_text(
         f"📍 <b>Zona selezionata:</b> {zone_name}\n\nCosa vuoi fare?",
-        reply_markup=kb.as_markup()
+        reply_markup=kb.as_markup(),
     )
     await cb.answer()
+
 
 @dp.callback_query(F.data == "zone_add_new")
 async def zone_add_new_handler(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AddZoneForm.waiting_for_location)
-    
-    # Crea tastiera per inviare posizione
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Invia posizione", request_location=True)]],
-        resize_keyboard=True
-    )
-    
-    await cb.message.edit_text(
-        "📍 <b>Aggiungi nuova zona</b>\n\nInvia la posizione della nuova zona di lavoro:"
-    )
-    await bot.send_message(
-        cb.message.chat.id,
-        "Usa il bottone qui sotto per inviare la posizione:",
-        reply_markup=kb
-    )
+    await cb.message.edit_text("📍 <b>Aggiungi nuova zona</b>\n\nUsa il bottone qui sotto per inviare la posizione:")
+    await bot.send_message(cb.message.chat.id, "Invia la posizione:", reply_markup=location_kb)
     await cb.answer()
+
 
 @dp.callback_query(F.data == "zone_back")
 async def zone_back_handler(cb: CallbackQuery):
-    # Ricarica la lista delle zone
     try:
-        work_locations = get_work_locations()
-        if not work_locations:
-            # Crea bottone per aggiungere la prima zona
-            kb = InlineKeyboardBuilder()
-            kb.button(text="➕ Aggiungi prima zona", callback_data="zone_add_new")
-            kb.adjust(1)
-            
-            await cb.message.edit_text(
-                "❌ Nessuna zona trovata.\n\nAggiungi la tua prima zona di lavoro:",
-                reply_markup=kb.as_markup()
-            )
-            return
-        
-        kb = InlineKeyboardBuilder()
-        for zone_name in work_locations.keys():
-            kb.button(text=f"📍 {zone_name}", callback_data=f"zone_select:{zone_name}")
-        
-        # Aggiungi bottone per aggiungere nuova zona
-        kb.button(text="➕ Aggiungi zona", callback_data="zone_add_new")
-        
-        kb.adjust(1)
-        
-        await cb.message.edit_text(
-            "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla, oppure aggiungi una nuova zona:",
-            reply_markup=kb.as_markup()
-        )
+        await _show_zones_list(cb)  # FIX #7 – usa helper DRY
     except Exception as e:
         logger.exception("Errore zone_back: %s", e)
         await cb.message.edit_text("❌ Errore nel caricamento delle zone.")
-    
     await cb.answer()
+
 
 @dp.callback_query(F.data.startswith("zone_edit:"))
 async def zone_edit_handler(cb: CallbackQuery, state: FSMContext):
     zone_name = cb.data.split(":", 1)[1]
     await state.update_data(editing_zone=zone_name)
     await state.set_state(ZoneManagementForm.waiting_for_new_name)
-    
     await cb.message.edit_text(
-        f"✏️ <b>Modifica zona:</b> {zone_name}\n\nInserisci il nuovo nome per questa zona:"
+        f"✏️ <b>Modifica zona:</b> {zone_name}\n\nInserisci il nuovo nome (o scrivi <b>Annulla</b>):"
     )
     await cb.answer()
+
 
 @dp.callback_query(F.data.startswith("zone_delete:"))
 async def zone_delete_handler(cb: CallbackQuery):
     zone_name = cb.data.split(":", 1)[1]
-    
-    # Crea bottoni di conferma
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Conferma rimozione", callback_data=f"zone_confirm_delete:{zone_name}")
     kb.button(text="❌ Annulla", callback_data=f"zone_select:{zone_name}")
     kb.adjust(1)
-    
     await cb.message.edit_text(
-        f"🗑️ <b>Conferma rimozione</b>\n\nSei sicuro di voler rimuovere la zona <b>{zone_name}</b>?\n\nQuesta azione non può essere annullata.",
-        reply_markup=kb.as_markup()
+        f"🗑️ <b>Conferma rimozione</b>\n\nSei sicuro di voler rimuovere <b>{zone_name}</b>?\nQuesta azione non può essere annullata.",
+        reply_markup=kb.as_markup(),
     )
     await cb.answer()
+
 
 @dp.callback_query(F.data.startswith("zone_confirm_delete:"))
 async def zone_confirm_delete_handler(cb: CallbackQuery):
     zone_name = cb.data.split(":", 1)[1]
-    
-    if delete_zone(zone_name):
-        await cb.message.edit_text(f"✅ Zona <b>{zone_name}</b> rimossa con successo!")
+    # FIX #1 – chiamata async
+    if await asyncio.to_thread(delete_zone, zone_name):
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Torna alla lista", callback_data="zone_back")
+        kb.adjust(1)
+        await cb.message.edit_text(
+            f"✅ Zona <b>{zone_name}</b> rimossa con successo!",
+            reply_markup=kb.as_markup(),
+        )
     else:
         await cb.message.edit_text(f"❌ Errore nella rimozione della zona <b>{zone_name}</b>.")
-    
     await cb.answer()
+
 
 @dp.message(ZoneManagementForm.waiting_for_new_name)
 async def zone_new_name_handler(message: Message, state: FSMContext):
@@ -730,24 +797,28 @@ async def zone_new_name_handler(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("❌ Operazione annullata.", reply_markup=main_kb)
         return
-    
     data = await state.get_data()
     old_name = data.get("editing_zone")
     new_name = message.text.strip()
-    
     if not old_name or not new_name:
         await message.answer("❌ Dati mancanti. Riprova con /listzones.", reply_markup=main_kb)
         await state.clear()
         return
-    
-    if update_zone_name(old_name, new_name):
-        await message.answer(f"✅ Zona rinominata con successo!\n\n<b>Prima:</b> {old_name}\n<b>Dopo:</b> {new_name}", reply_markup=main_kb)
+    # FIX #1 – chiamata async
+    if await asyncio.to_thread(update_zone_name, old_name, new_name):
+        await message.answer(
+            f"✅ Zona rinominata!\n<b>Prima:</b> {old_name}\n<b>Dopo:</b> {new_name}",
+            reply_markup=main_kb,
+        )
     else:
         await message.answer(f"❌ Errore nella modifica della zona <b>{old_name}</b>.", reply_markup=main_kb)
-    
     await state.clear()
 
-# ---------------- Scheduler / Reminders ----------------
+
+# ============================================================
+# Scheduler / Reminders
+# FIX #4 – allineati commenti e orari effettivi
+# ============================================================
 async def send_reminder(user_id: int, text: str) -> None:
     try:
         await bot.send_message(user_id, text)
@@ -755,71 +826,66 @@ async def send_reminder(user_id: int, text: str) -> None:
     except Exception as e:
         logger.error("Errore invio reminder a %s: %s", user_id, e)
 
+
 async def remind_ingresso() -> None:
     try:
-        weekday = datetime.now(TIMEZONE).weekday()
-        if weekday >= 5:
+        if datetime.now(TIMEZONE).weekday() >= 5:
             logger.debug("skip remind_ingresso (weekend)")
             return
         today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-        logger.info("Eseguo remind_ingresso per %s", today)
-        sheet = get_sheet("Registro")
-        rows = sheet.get_all_values()
+        # FIX #1 – chiamata async
+        sheet = await asyncio.to_thread(get_sheet, "Registro")
+        rows = await asyncio.to_thread(sheet.get_all_values)
         if len(rows) < 2:
-            logger.info("Nessun utente nel foglio.")
             return
-        all_users = set(row[1] for row in rows[1:] if len(row) > 1 and row[1])
-        registered_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
+        all_users = {row[1] for row in rows[1:] if len(row) > 1 and row[1]}
+        registered_today = {row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2]}
         missing_users = all_users - registered_today
-        logger.info("Utenti totali: %s, registrati oggi: %s, mancanti: %s", len(all_users), len(registered_today), len(missing_users))
+        logger.info("remind_ingresso – mancanti: %d", len(missing_users))
         for user_str in missing_users:
+            parts = user_str.rsplit(" | ", 1)
+            if len(parts) != 2:
+                continue
+            name, uid_str = parts
             try:
-                parts = user_str.rsplit(" | ", 1)
-                if len(parts) != 2:
-                    logger.warning("Formato user non valido: %s", user_str)
-                    continue
-                name, uid_str = parts[0], parts[1]
-                user_id = int(uid_str)
-                await send_reminder(user_id, f"Ciao {name}, ricorda di registrare l'ingresso 🔔")
+                await send_reminder(int(uid_str), f"Ciao {name}, ricorda di registrare l'ingresso 🔔")
             except Exception as e:
                 logger.error("Errore reminder ingresso per %s: %s", user_str, e)
     except Exception as e:
         logger.exception("Errore remind_ingresso: %s", e)
 
+
 async def remind_uscita() -> None:
     try:
-        weekday = datetime.now(TIMEZONE).weekday()
-        if weekday >= 5:
+        if datetime.now(TIMEZONE).weekday() >= 5:
             logger.debug("skip remind_uscita (weekend)")
             return
         today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-        logger.info("Eseguo remind_uscita per %s", today)
-        sheet = get_sheet("Registro")
-        rows = sheet.get_all_values()
+        # FIX #1 – chiamata async
+        sheet = await asyncio.to_thread(get_sheet, "Registro")
+        rows = await asyncio.to_thread(sheet.get_all_values)
         if len(rows) < 2:
-            logger.info("Nessun dato nel foglio.")
             return
-        all_users_today = set(row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2])
-        exited_today = set(row[1] for row in rows[1:] if len(row) > 4 and row[0] == today and row[4])
-        missing_exit = all_users_today - exited_today
-        logger.info("Ingressi oggi: %s, uscite registrate: %s, mancanti: %s", len(all_users_today), len(exited_today), len(missing_exit))
+        entered_today = {row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2]}
+        exited_today = {row[1] for row in rows[1:] if len(row) > 4 and row[0] == today and row[4]}
+        missing_exit = entered_today - exited_today
+        logger.info("remind_uscita – mancanti: %d", len(missing_exit))
         for user_str in missing_exit:
+            parts = user_str.rsplit(" | ", 1)
+            if len(parts) != 2:
+                continue
+            name, uid_str = parts
             try:
-                parts = user_str.rsplit(" | ", 1)
-                if len(parts) != 2:
-                    logger.warning("Formato user non valido: %s", user_str)
-                    continue
-                name, uid_str = parts[0], parts[1]
-                user_id = int(uid_str)
-                await send_reminder(user_id, f"Ciao {name}, non dimenticare di registrare l'uscita! 🔔")
+                await send_reminder(int(uid_str), f"Ciao {name}, non dimenticare di registrare l'uscita! 🔔")
             except Exception as e:
                 logger.error("Errore reminder uscita per %s: %s", user_str, e)
     except Exception as e:
         logger.exception("Errore remind_uscita: %s", e)
 
+
 async def scheduler_loop() -> None:
     global _last_ingresso_date, _last_uscita_date
-    logger.info("Scheduler loop avviato (controllo ogni 30s, timezone Europe/Rome)")
+    logger.info("Scheduler loop avviato (controllo ogni 30s)")
     try:
         while True:
             try:
@@ -827,48 +893,66 @@ async def scheduler_loop() -> None:
                 hhmm = now.strftime("%H:%M")
                 today_date = now.date()
 
-                # alle 08:30 Europe/Rome -> remind_ingresso
+                # FIX #4 – orario e commento ora coincidono
                 if hhmm == "08:00" and _last_ingresso_date != today_date:
-                    logger.info("Orario 08:30: lancio remind_ingresso")
+                    logger.info("Orario 08:00: lancio remind_ingresso")
                     asyncio.create_task(remind_ingresso())
                     _last_ingresso_date = today_date
 
-                # alle 16:00 Europe/Rome -> remind_uscita
                 if hhmm == "17:00" and _last_uscita_date != today_date:
-                    logger.info("Orario 16:00: lancio remind_uscita")
+                    logger.info("Orario 17:00: lancio remind_uscita")
                     asyncio.create_task(remind_uscita())
                     _last_uscita_date = today_date
 
             except asyncio.CancelledError:
-                logger.info("Scheduler loop cancellato, esco.")
                 raise
             except Exception as e:
                 logger.exception("Errore nel scheduler loop: %s", e)
 
             await asyncio.sleep(30)
     except asyncio.CancelledError:
-        logger.info("Scheduler loop terminato (cancellato).")
+        logger.info("Scheduler loop terminato.")
 
-# comando test per forzare i reminder
+
+# FIX #5 – /remindtest ora richiede i permessi admin
 @dp.message(F.text == "/remindtest")
 async def remindtest_handler(message: Message):
+    if message.from_user.id not in ADMINS:
+        await message.answer("❌ Non hai i permessi per eseguire questo comando.")
+        return
     await message.answer("Eseguo test reminder (ingresso + uscita).")
     asyncio.create_task(remind_ingresso())
     asyncio.create_task(remind_uscita())
 
-# ---------------- FastAPI + lifecycle ----------------
+
+# ============================================================
+# FastAPI + lifecycle
+# ============================================================
 async def on_startup() -> None:
-    init_sheets()
+    await asyncio.to_thread(init_sheets)
+
+    # FIX #9 – registra il webhook su Telegram all'avvio
+    if WEBHOOK_URL:
+        webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
+        await bot.set_webhook(webhook_endpoint)
+        logger.info("Webhook impostato: %s", webhook_endpoint)
+    else:
+        logger.warning("WEBHOOK_URL non impostato: il webhook NON è stato registrato su Telegram.")
+
     asyncio.create_task(scheduler_loop())
-    logger.info("On startup completato: scheduler avviato.")
+    logger.info("Startup completato.")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await on_startup()
     yield
+    await bot.delete_webhook()
     logger.info("Shutdown completato.")
 
+
 app = FastAPI(lifespan=lifespan)
+
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -880,11 +964,15 @@ async def webhook(request: Request):
         logger.exception("Errore nel webhook: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
 @app.get("/")
 async def health_check():
     return "Bot is running"
 
-# ---------------- Main (uvicorn entrypoint) ----------------
+
+# ============================================================
+# Main
+# ============================================================
 if __name__ == "__main__":
     import uvicorn
     logger.info("Avvio uvicorn FastAPI + webhook")
