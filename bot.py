@@ -262,8 +262,14 @@ def _sync_save_uscita(user: types.User, time_str: str, location_name: str) -> bo
         rows = sheet.get_all_values()
         for i, row in enumerate(rows[1:], start=2):
             if len(row) > 4 and row[0] == today and row[1] == user_id and not row[4]:
-                sheet.update_cell(i, 5, time_str)
-                sheet.update_cell(i, 6, location_name)
+                # batch_update invia un'unica richiesta HTTP invece di due
+                # → risparmia ~300ms per ogni registrazione uscita
+                col_e = gspread.utils.rowcol_to_a1(i, 5)  # Es. E5
+                col_f = gspread.utils.rowcol_to_a1(i, 6)  # Es. F5
+                sheet.batch_update([{
+                    'range': f'{col_e}:{col_f}',
+                    'values': [[time_str, location_name]]
+                }])
                 return True
         logger.warning("Nessun ingresso trovato per %s oggi.", user_id)
         return False
