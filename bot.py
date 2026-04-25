@@ -53,8 +53,9 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
-_last_ingresso_date: Optional[date] = None
-_last_uscita_date: Optional[date] = None
+# Traccia i reminder già inviati oggi per ogni utente {user_id: date}
+_sent_ingresso_today: Dict[int, date] = {}
+_sent_uscita_today: Dict[int, date] = {}
 
 
 # ============================================================
@@ -241,6 +242,8 @@ def _sync_save_ingresso(user: types.User, time_str: str, location_name: str) -> 
                 logger.warning("Ingresso già registrato per %s oggi.", user_id)
                 return False
         sheet.append_row([today, user_id, time_str, location_name, "", ""])
+        # Registra l'utente nel foglio Notifiche se non esiste già
+        upsert_user_notifiche(user.id, user.full_name)
         return True
     except Exception as e:
         logger.exception("Errore save_ingresso: %s", e)
@@ -339,9 +342,121 @@ def init_sheets() -> None:
                 sheet_zone.append_row(["Nome", "Latitudine", "Longitudine"])
         except Exception:
             pass
+        try:
+            sheet_notif = get_sheet("Notifiche")
+            if not sheet_notif.row_values(1):
+                sheet_notif.append_row([
+                    "Telegram ID", "Nome",
+                    "Reminder Ingresso", "Orario Ingresso",
+                    "Reminder Uscita", "Orario Uscita"
+                ])
+        except Exception:
+            pass
         logger.info("Sheets inizializzati.")
     except Exception as e:
         logger.error("Errore init_sheets: %s", e)
+
+
+# ============================================================
+# Notifiche sheet helpers
+# ============================================================
+# Struttura foglio "Notifiche":
+# Col A: Telegram ID  B: Nome  C: Reminder Ingresso (TRUE/FALSE)
+# Col D: Orario Ingresso (HH:MM)  E: Reminder Uscita (TRUE/FALSE)
+# Col F: Orario Uscita (HH:MM)
+
+def get_notifiche_settings() -> Dict[int, dict]:
+    """
+    Legge il foglio Notifiche e restituisce un dict {user_id: cfg}.
+    cfg = {nome, reminder_ingresso, orario_ingresso,
+           reminder_uscita, orario_uscita, row_index}
+    """
+    try:
+        sheet = get_sheet("Notifiche")
+        rows = sheet.get_all_values()
+        result: Dict[int, dict] = {}
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) < 6 or not row[0].strip():
+                continue
+            try:
+                uid = int(row[0].strip())
+            except ValueError:
+                continue
+            result[uid] = {
+                "nome": row[1],
+                "reminder_ingresso": row[2].strip().upper() == "TRUE",
+                "orario_ingresso": row[3].strip() or "08:00",
+                "reminder_uscita": row[4].strip().upper() == "TRUE",
+                "orario_uscita": row[5].strip() or "17:00",
+                "row_index": i,
+            }
+        return result
+    except Exception as e:
+        logger.exception("Errore get_notifiche_settings: %s", e)
+        return {}
+
+
+def upsert_user_notifiche(user_id: int, nome: str,
+                           reminder_in: bool = True, orario_in: str = "08:00",
+                           reminder_out: bool = True, orario_out: str = "17:00") -> bool:
+    """
+    Aggiunge l'utente al foglio Notifiche se non esiste.
+    Se già esiste non sovrascrive i suoi settings.
+    """
+    try:
+        sheet = get_sheet("Notifiche")
+        rows = sheet.get_all_values()
+        for row in rows[1:]:
+            if row and row[0].strip() == str(user_id):
+                return True  # già presente, non toccare
+        sheet.append_row([
+            str(user_id), nome,
+            "TRUE" if reminder_in else "FALSE", orario_in,
+            "TRUE" if reminder_out else "FALSE", orario_out,
+        ])
+        return True
+    except Exception as e:
+        logger.exception("Errore upsert_user_notifiche: %s", e)
+        return False
+
+
+def toggle_notifica(user_id: int, tipo: str) -> Optional[bool]:
+    """
+    Inverte il valore di Reminder Ingresso (tipo='in') o Uscita (tipo='out').
+    Ritorna il nuovo valore (True/False) o None se errore.
+    """
+    col = 3 if tipo == "in" else 5  # col C o E (1-indexed)
+    try:
+        sheet = get_sheet("Notifiche")
+        rows = sheet.get_all_values()
+        for i, row in enumerate(rows[1:], start=2):
+            if row and row[0].strip() == str(user_id):
+                current = row[col - 1].strip().upper() == "TRUE"
+                new_val = not current
+                sheet.update_cell(i, col, "TRUE" if new_val else "FALSE")
+                return new_val
+        return None
+    except Exception as e:
+        logger.exception("Errore toggle_notifica: %s", e)
+        return None
+
+
+def set_orario_notifica(user_id: int, tipo: str, orario: str) -> bool:
+    """
+    Aggiorna Orario Ingresso (tipo='in', col D) o Uscita (tipo='out', col F).
+    """
+    col = 4 if tipo == "in" else 6
+    try:
+        sheet = get_sheet("Notifiche")
+        rows = sheet.get_all_values()
+        for i, row in enumerate(rows[1:], start=2):
+            if row and row[0].strip() == str(user_id):
+                sheet.update_cell(i, col, orario)
+                return True
+        return False
+    except Exception as e:
+        logger.exception("Errore set_orario_notifica: %s", e)
+        return False
 
 
 # ============================================================
@@ -716,39 +831,64 @@ async def riepilogo_month_handler(cb: CallbackQuery):
 # ============================================================
 @dp.message(F.text == "📘 Istruzioni Bot")
 async def istruzioni_handler(message: Message):
-    istruzioni_text = """<b>🔹 Come utilizzare il bot</b>
-<b>Avvio</b>
-Apri la chat con il bot e invia il comando /start.
-Ti verrà mostrato un menu con le seguenti opzioni:
-🕓 Ingresso | 🚪 Uscita | 📝 Richiesta permessi | 📄 Riepilogo
+    istruzioni_text = (
+        "<b>📖 Guida al Bot Presenze</b>\n\n"
 
-<b>Registrazione ingresso</b>
-Premi "Ingresso" → invia la posizione (📍).
-Il sistema verifica che tu sia in una sede autorizzata e registra data, ora e posizione.
+        "<b>▶️ Avvio</b>\n"
+        "Invia /start per aprire il menu principale con questi tasti:\n"
+        "🕓 Ingresso  🚪 Uscita  📝 Permessi  📄 Riepilogo\n\n"
 
-<b>Registrazione uscita</b>
-Premi "Uscita" e invia la posizione come sopra.
-Il bot aggiorna il registro giornaliero con l'orario di uscita.
+        "<b>🕓 Registrazione ingresso</b>\n"
+        "1. Premi <b>Ingresso</b>\n"
+        "2. Tocca il bottone 📍 <b>Invia posizione</b>\n"
+        "3. Il bot verifica che tu sia in una sede autorizzata e salva ora e luogo.\n"
+        "⚠️ Puoi registrare un solo ingresso al giorno.\n\n"
 
-<b>Richiesta permessi</b>
-Seleziona le date dal calendario e inserisci il motivo (ferie, malattia, permesso…).
+        "<b>🚪 Registrazione uscita</b>\n"
+        "1. Premi <b>Uscita</b> e invia la posizione come sopra.\n"
+        "2. Il bot aggiorna il tuo registro con l'orario di uscita.\n"
+        "⚠️ È necessario aver già registrato l'ingresso nella stessa giornata.\n\n"
 
-<b>Riepilogo personale</b>
-Scarica un CSV completo dei tuoi ingressi e uscite.
+        "<b>📝 Richiesta permessi</b>\n"
+        "1. Premi <b>Richiesta permessi</b>\n"
+        "2. Seleziona la <b>data di inizio</b> dal calendario (🔵 = oggi)\n"
+        "3. Seleziona la <b>data di fine</b>\n"
+        "4. Scrivi il <b>motivo</b> (es. ferie, malattia, permesso)\n"
+        "La richiesta viene salvata nel foglio Permessi su Google Sheets.\n\n"
 
-<b>🔹 Geolocalizzazione</b>
-📍 Il bot NON traccia mai la posizione in automatico.
-La localizzazione è usata solo quando l'utente la invia manualmente.
-✅ Vengono registrati: data/ora, nome e ID Telegram, luogo riconosciuto.
-❌ Nessun tracciamento in background.
+        "<b>📄 Riepilogo presenze</b>\n"
+        "1. Premi <b>Riepilogo</b>\n"
+        "2. Scegli l'<b>anno</b>\n"
+        "3. Scegli il <b>mese</b>\n"
+        "Riceverai un file CSV con tutti i tuoi ingressi e uscite di quel mese.\n\n"
 
-<b>🔹 Privacy (GDPR UE 2016/679)</b>
-Trasparenza · Minimizzazione · Limitazione temporale · Sicurezza
-L'accesso ai dati su Google Sheets è riservato ai responsabili autorizzati.
+        "<b>🔔 Notifiche reminder</b>\n"
+        "Il bot ti invia automaticamente un promemoria se dimentichi di timbrare.\n"
+        "• Il reminder di ingresso viene mandato all'orario da te configurato\n"
+        "• Il reminder di uscita viene mandato al tuo orario di uscita\n"
+        "• I reminder <b>non vengono inviati sabato e domenica</b>\n"
+        "• Puoi attivare/disattivare e cambiare l'orario con /mienotifiche\n"
+        "• Vieni aggiunto automaticamente al primo ingresso registrato\n\n"
 
-<b>🔹 Assistenza</b>
-📧 sserviceitalia@gmail.com – Shust Dmytro (3298333622)
-"""
+        "<b>⚙️ Comando /mienotifiche</b>\n"
+        "Gestisci le tue notifiche personali:\n"
+        "• Attiva o disattiva il reminder di ingresso\n"
+        "• Attiva o disattiva il reminder di uscita\n"
+        "• Imposta l'orario desiderato per ciascuno (formato HH:MM)\n\n"
+
+        "<b>📍 Geolocalizzazione e privacy</b>\n"
+        "Il bot <b>NON traccia mai</b> la posizione in automatico.\n"
+        "La posizione viene usata solo quando la invii tu manualmente.\n"
+        "Dati registrati: data/ora · nome e ID Telegram · sede riconosciuta.\n"
+        "Nessun tracciamento in background, nessuna condivisione con terzi.\n\n"
+
+        "<b>🛡️ GDPR (UE 2016/679)</b>\n"
+        "Trasparenza · Minimizzazione · Limitazione temporale · Sicurezza\n"
+        "I dati sono accessibili solo ai responsabili autorizzati.\n\n"
+
+        "<b>📧 Assistenza</b>\n"
+        "sserviceitalia@gmail.com – Shust Dmytro (3298333622)"
+    )
     await message.answer(istruzioni_text, reply_markup=main_kb)
 
 
@@ -914,8 +1054,7 @@ async def zone_new_name_handler(message: Message, state: FSMContext):
 
 
 # ============================================================
-# Scheduler / Reminders
-# FIX #4 – allineati commenti e orari effettivi
+# Scheduler / Reminders – per-utente con settings da Sheets
 # ============================================================
 async def send_reminder(user_id: int, text: str) -> None:
     try:
@@ -925,82 +1064,75 @@ async def send_reminder(user_id: int, text: str) -> None:
         logger.error("Errore invio reminder a %s: %s", user_id, e)
 
 
-async def remind_ingresso() -> None:
-    try:
-        if datetime.now(TIMEZONE).weekday() >= 5:
-            logger.debug("skip remind_ingresso (weekend)")
-            return
-        today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-        # FIX #1 – chiamata async
-        sheet = await asyncio.to_thread(get_sheet, "Registro")
-        rows = await asyncio.to_thread(sheet.get_all_values)
-        if len(rows) < 2:
-            return
-        all_users = {row[1] for row in rows[1:] if len(row) > 1 and row[1]}
-        registered_today = {row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2]}
-        missing_users = all_users - registered_today
-        logger.info("remind_ingresso – mancanti: %d", len(missing_users))
-        for user_str in missing_users:
-            parts = user_str.rsplit(" | ", 1)
-            if len(parts) != 2:
-                continue
-            name, uid_str = parts
-            try:
-                await send_reminder(int(uid_str), f"Ciao {name}, ricorda di registrare l'ingresso 🔔")
-            except Exception as e:
-                logger.error("Errore reminder ingresso per %s: %s", user_str, e)
-    except Exception as e:
-        logger.exception("Errore remind_ingresso: %s", e)
-
-
-async def remind_uscita() -> None:
-    try:
-        if datetime.now(TIMEZONE).weekday() >= 5:
-            logger.debug("skip remind_uscita (weekend)")
-            return
-        today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
-        # FIX #1 – chiamata async
-        sheet = await asyncio.to_thread(get_sheet, "Registro")
-        rows = await asyncio.to_thread(sheet.get_all_values)
-        if len(rows) < 2:
-            return
-        entered_today = {row[1] for row in rows[1:] if len(row) > 2 and row[0] == today and row[2]}
-        exited_today = {row[1] for row in rows[1:] if len(row) > 4 and row[0] == today and row[4]}
-        missing_exit = entered_today - exited_today
-        logger.info("remind_uscita – mancanti: %d", len(missing_exit))
-        for user_str in missing_exit:
-            parts = user_str.rsplit(" | ", 1)
-            if len(parts) != 2:
-                continue
-            name, uid_str = parts
-            try:
-                await send_reminder(int(uid_str), f"Ciao {name}, non dimenticare di registrare l'uscita! 🔔")
-            except Exception as e:
-                logger.error("Errore reminder uscita per %s: %s", user_str, e)
-    except Exception as e:
-        logger.exception("Errore remind_uscita: %s", e)
-
-
 async def scheduler_loop() -> None:
-    global _last_ingresso_date, _last_uscita_date
-    logger.info("Scheduler loop avviato (controllo ogni 30s)")
+    """
+    Scheduler per-utente: ogni 30s legge le impostazioni dal foglio Notifiche
+    e invia i reminder agli utenti il cui orario configurato coincide con l'ora
+    attuale, solo se non hanno già registrato ingresso/uscita oggi e il reminder
+    non è già stato inviato nella stessa giornata.
+    """
+    logger.info("Scheduler loop avviato (controllo ogni 30s, per-utente)")
     try:
         while True:
             try:
                 now = datetime.now(TIMEZONE)
-                hhmm = now.strftime("%H:%M")
-                today_date = now.date()
+                # Salta weekend
+                if now.weekday() < 5:
+                    hhmm = now.strftime("%H:%M")
+                    today = now.strftime("%d.%m.%Y")
+                    today_date = now.date()
 
-                # FIX #4 – orario e commento ora coincidono
-                if hhmm == "08:00" and _last_ingresso_date != today_date:
-                    logger.info("Orario 08:00: lancio remind_ingresso")
-                    asyncio.create_task(remind_ingresso())
-                    _last_ingresso_date = today_date
+                    # Carica settings e registro in thread separati
+                    settings = await asyncio.to_thread(get_notifiche_settings)
+                    if settings:
+                        sheet_reg = await asyncio.to_thread(get_sheet, "Registro")
+                        reg_rows = await asyncio.to_thread(sheet_reg.get_all_values)
 
-                if hhmm == "17:00" and _last_uscita_date != today_date:
-                    logger.info("Orario 17:00: lancio remind_uscita")
-                    asyncio.create_task(remind_uscita())
-                    _last_uscita_date = today_date
+                        # Set di chi ha già fatto ingresso/uscita oggi
+                        entered_today = {
+                            row[1] for row in reg_rows[1:]
+                            if len(row) > 2 and row[0] == today and row[2]
+                        }
+                        exited_today = {
+                            row[1] for row in reg_rows[1:]
+                            if len(row) > 4 and row[0] == today and row[4]
+                        }
+
+                        for uid, cfg in settings.items():
+                            user_str = cfg["nome"]
+                            # Cerca la stringa "Nome | ID" usata nel Registro
+                            # (cerca per ID nella parte finale)
+                            user_key = next(
+                                (s for s in entered_today | exited_today
+                                 if s.endswith(f"| {uid}")),
+                                None
+                            )
+
+                            # --- Reminder ingresso ---
+                            if (cfg["reminder_ingresso"]
+                                    and hhmm == cfg["orario_ingresso"]
+                                    and _sent_ingresso_today.get(uid) != today_date):
+                                # Non ha ancora fatto ingresso oggi?
+                                has_entered = any(s.endswith(f"| {uid}") for s in entered_today)
+                                if not has_entered:
+                                    await send_reminder(
+                                        uid,
+                                        f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'ingresso!"
+                                    )
+                                    _sent_ingresso_today[uid] = today_date
+
+                            # --- Reminder uscita ---
+                            if (cfg["reminder_uscita"]
+                                    and hhmm == cfg["orario_uscita"]
+                                    and _sent_uscita_today.get(uid) != today_date):
+                                has_entered = any(s.endswith(f"| {uid}") for s in entered_today)
+                                has_exited = any(s.endswith(f"| {uid}") for s in exited_today)
+                                if has_entered and not has_exited:
+                                    await send_reminder(
+                                        uid,
+                                        f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'uscita!"
+                                    )
+                                    _sent_uscita_today[uid] = today_date
 
             except asyncio.CancelledError:
                 raise
@@ -1012,15 +1144,220 @@ async def scheduler_loop() -> None:
         logger.info("Scheduler loop terminato.")
 
 
-# FIX #5 – /remindtest ora richiede i permessi admin
+# ============================================================
+# Handlers – /mienotifiche (ogni utente gestisce i propri)
+# ============================================================
+def _build_notif_kb_user(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    stato_in = "✅ ON" if cfg["reminder_ingresso"] else "❌ OFF"
+    stato_out = "✅ ON" if cfg["reminder_uscita"] else "❌ OFF"
+    kb.button(text=f"🕓 Ingresso: {stato_in}", callback_data=f"notif:toggle_in:{uid}")
+    kb.button(text=f"⏰ Orario ingresso: {cfg['orario_ingresso']}", callback_data=f"notif:set_orario_in:{uid}")
+    kb.button(text=f"🚪 Uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
+    kb.button(text=f"⏰ Orario uscita: {cfg['orario_uscita']}", callback_data=f"notif:set_orario_out:{uid}")
+    kb.adjust(2, 2)
+    return kb.as_markup()
+
+
+@dp.message(F.text == "/mienotifiche")
+async def mienotifiche_handler(message: Message):
+    uid = message.from_user.id
+    settings = await asyncio.to_thread(get_notifiche_settings)
+    if uid not in settings:
+        await message.answer(
+            "⚠️ Non sei ancora registrato nel sistema notifiche.\n"
+            "Registra almeno un ingresso per essere aggiunto automaticamente."
+        )
+        return
+    cfg = settings[uid]
+    await message.answer(
+        "🔔 <b>Le tue notifiche</b>\n\nTocca un bottone per attivare/disattivare o cambiare l'orario:",
+        reply_markup=_build_notif_kb_user(uid, cfg),
+    )
+
+
+# ============================================================
+# Handlers – /notifiche (admin: vede tutti gli utenti)
+# ============================================================
+@dp.message(F.text == "/notifiche")
+async def notifiche_admin_handler(message: Message):
+    if message.from_user.id not in ADMINS:
+        await message.answer("❌ Non hai i permessi.")
+        return
+    settings = await asyncio.to_thread(get_notifiche_settings)
+    if not settings:
+        await message.answer("❌ Nessun utente nel foglio Notifiche.")
+        return
+    kb = InlineKeyboardBuilder()
+    for uid, cfg in settings.items():
+        stato = "✅" if (cfg["reminder_ingresso"] or cfg["reminder_uscita"]) else "❌"
+        kb.button(
+            text=f"{stato} {cfg['nome']}",
+            callback_data=f"notif:admin_user:{uid}"
+        )
+    kb.adjust(1)
+    await message.answer(
+        "👥 <b>Gestione notifiche utenti</b>\n\nSeleziona un utente:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("notif:admin_user:"))
+async def notif_admin_user_handler(cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:
+        await cb.answer("❌ Non autorizzato.", show_alert=True)
+        return
+    uid = int(cb.data.split(":")[2])
+    settings = await asyncio.to_thread(get_notifiche_settings)
+    if uid not in settings:
+        await cb.answer("Utente non trovato.", show_alert=True)
+        return
+    cfg = settings[uid]
+    nome = cfg['nome']
+    in_stato = '✅ ON' if cfg['reminder_ingresso'] else '❌ OFF'
+    out_stato = '✅ ON' if cfg['reminder_uscita'] else '❌ OFF'
+    testo = (
+        f"👤 <b>{nome}</b>\n\n"
+        f"🕓 Ingresso: {in_stato} — {cfg['orario_ingresso']}\n"
+        f"🚪 Uscita: {out_stato} — {cfg['orario_uscita']}"
+    )
+    await cb.message.edit_text(testo, reply_markup=_build_notif_kb_admin(uid, cfg))
+    await cb.answer()
+
+
+def _build_notif_kb_admin(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    stato_in = "✅ ON" if cfg["reminder_ingresso"] else "❌ OFF"
+    stato_out = "✅ ON" if cfg["reminder_uscita"] else "❌ OFF"
+    kb.button(text=f"🕓 Ingresso: {stato_in}", callback_data=f"notif:toggle_in:{uid}")
+    kb.button(text=f"⏰ Orario: {cfg['orario_ingresso']}", callback_data=f"notif:set_orario_in:{uid}")
+    kb.button(text=f"🚪 Uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
+    kb.button(text=f"⏰ Orario: {cfg['orario_uscita']}", callback_data=f"notif:set_orario_out:{uid}")
+    kb.button(text="🔙 Torna alla lista", callback_data="notif:admin_list")
+    kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+@dp.callback_query(F.data == "notif:admin_list")
+async def notif_admin_list_handler(cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:
+        await cb.answer("❌ Non autorizzato.", show_alert=True)
+        return
+    settings = await asyncio.to_thread(get_notifiche_settings)
+    kb = InlineKeyboardBuilder()
+    for uid, cfg in settings.items():
+        stato = "✅" if (cfg["reminder_ingresso"] or cfg["reminder_uscita"]) else "❌"
+        kb.button(text=f"{stato} {cfg['nome']}", callback_data=f"notif:admin_user:{uid}")
+    kb.adjust(1)
+    await cb.message.edit_text(
+        "👥 <b>Gestione notifiche utenti</b>\n\nSeleziona un utente:",
+        reply_markup=kb.as_markup(),
+    )
+    await cb.answer()
+
+
+# Toggle attiva/disattiva reminder (usato sia da utente che da admin)
+@dp.callback_query(F.data.startswith("notif:toggle_in:") | F.data.startswith("notif:toggle_out:"))
+async def notif_toggle_handler(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    tipo = "in" if parts[1] == "toggle_in" else "out"
+    uid = int(parts[2])
+
+    # Solo l'utente stesso o un admin può modificare
+    if cb.from_user.id != uid and cb.from_user.id not in ADMINS:
+        await cb.answer("❌ Non autorizzato.", show_alert=True)
+        return
+
+    new_val = await asyncio.to_thread(toggle_notifica, uid, tipo)
+    if new_val is None:
+        await cb.answer("❌ Errore nel salvataggio.", show_alert=True)
+        return
+
+    stato = "✅ attivato" if new_val else "❌ disattivato"
+    tipo_str = "ingresso" if tipo == "in" else "uscita"
+    await cb.answer(f"Reminder {tipo_str} {stato}!")
+
+    # Aggiorna la tastiera con i nuovi valori
+    settings = await asyncio.to_thread(get_notifiche_settings)
+    if uid not in settings:
+        return
+    cfg = settings[uid]
+    is_admin_view = cb.from_user.id in ADMINS and cb.from_user.id != uid
+    new_kb = _build_notif_kb_admin(uid, cfg) if is_admin_view else _build_notif_kb_user(uid, cfg)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=new_kb)
+    except Exception:
+        pass
+
+
+# ============================================================
+# FSM – Cambio orario notifica
+# ============================================================
+class NotificheForm(StatesGroup):
+    waiting_for_orario = State()   # attende "HH:MM" dall'utente
+
+
+@dp.callback_query(F.data.startswith("notif:set_orario_in:") | F.data.startswith("notif:set_orario_out:"))
+async def notif_set_orario_start(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    tipo = "in" if parts[1] == "set_orario_in" else "out"
+    uid = int(parts[2])
+
+    if cb.from_user.id != uid and cb.from_user.id not in ADMINS:
+        await cb.answer("❌ Non autorizzato.", show_alert=True)
+        return
+
+    await state.update_data(notif_uid=uid, notif_tipo=tipo)
+    await state.set_state(NotificheForm.waiting_for_orario)
+    tipo_str = "ingresso" if tipo == "in" else "uscita"
+    msg = f"⏰ Inserisci il nuovo orario per il reminder di <b>{tipo_str}</b>\n\nFormato: <code>HH:MM</code> — es. <code>08:30</code>"
+    await cb.message.edit_text(msg)
+    await cb.answer()
+
+
+@dp.message(NotificheForm.waiting_for_orario)
+async def notif_set_orario_receive(message: Message, state: FSMContext):
+    testo = (message.text or "").strip()
+    # Validazione formato HH:MM
+    import re
+    if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", testo):
+        await message.answer("❌ Formato non valido. Scrivi l'orario come <code>HH:MM</code>, es. <code>08:30</code>")
+        return
+
+    data = await state.get_data()
+    uid = data["notif_uid"]
+    tipo = data["notif_tipo"]
+    await state.clear()
+
+    ok = await asyncio.to_thread(set_orario_notifica, uid, tipo, testo)
+    tipo_str = "ingresso" if tipo == "in" else "uscita"
+    if ok:
+        await message.answer(
+            f"✅ Orario reminder <b>{tipo_str}</b> aggiornato a <b>{testo}</b>!",
+            reply_markup=main_kb,
+        )
+    else:
+        await message.answer("❌ Errore nel salvataggio. L'utente potrebbe non essere nel foglio Notifiche.", reply_markup=main_kb)
+
+
+# /remindtest solo admin – forza invio immediato per test
 @dp.message(F.text == "/remindtest")
 async def remindtest_handler(message: Message):
     if message.from_user.id not in ADMINS:
         await message.answer("❌ Non hai i permessi per eseguire questo comando.")
         return
-    await message.answer("Eseguo test reminder (ingresso + uscita).")
-    asyncio.create_task(remind_ingresso())
-    asyncio.create_task(remind_uscita())
+    await message.answer("⏳ Eseguo test scheduler (simulo un check immediato)…")
+    # Forza l'ora corrente come se fosse l'orario configurato per ogni utente
+    settings = await asyncio.to_thread(get_notifiche_settings)
+    count = 0
+    for uid, cfg in settings.items():
+        if cfg["reminder_ingresso"]:
+            await send_reminder(uid, f"🔔 [TEST] Ciao {cfg['nome']}, reminder ingresso di prova!")
+            count += 1
+        if cfg["reminder_uscita"]:
+            await send_reminder(uid, f"🔔 [TEST] Ciao {cfg['nome']}, reminder uscita di prova!")
+            count += 1
+    await message.answer(f"✅ Inviati {count} reminder di test.")
 
 
 # ============================================================
