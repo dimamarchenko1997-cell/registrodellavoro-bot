@@ -1486,10 +1486,11 @@ async def webhook(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
-    # FastAPI risponde automaticamente alle richieste HEAD su route GET.
-    # Non serve @app.head() separato.
+    # methods=["GET","HEAD"] gestisce entrambi i metodi con un solo handler.
+    # Render usa HEAD / come health check: senza questa riga risponde 405
+    # e Render riavvia il servizio ogni pochi minuti.
     return {"status": "running", "webhook_url": WEBHOOK_URL or "NON IMPOSTATO"}
 
 
