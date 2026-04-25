@@ -41,7 +41,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")          # FIX #9 – es. https://tuo-dom
 PORT = int(os.getenv("PORT", 8000))
 TIMEZONE = pytz.timezone("Europe/Rome")
 
-# FIX #8 – fail veloce se il token manca, prima di creare qualsiasi oggetto
+# FIX #8 – fail veloce se il token manca, prima di creare qualsiasi oggett
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN non impostato nelle variabili d'ambiente.")
 
