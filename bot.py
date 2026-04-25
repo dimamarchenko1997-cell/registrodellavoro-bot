@@ -1065,31 +1065,70 @@ async def send_reminder(user_id: int, text: str) -> None:
         logger.error("Errore invio reminder a %s: %s", user_id, e)
 
 
+# Cache interna settings notifiche per lo scheduler (aggiornata ogni 5 min)
+_notifiche_cache: Dict[int, dict] = {}
+_notifiche_cache_time: Optional[datetime] = None
+_NOTIFICHE_TTL = 300  # 5 minuti
+
+
+async def _get_notifiche_cached() -> Dict[int, dict]:
+    """
+    Restituisce le impostazioni notifiche con cache 5 minuti.
+    Evita di leggere il foglio Notifiche ad ogni tick dello scheduler (ogni 30s).
+    Prima lo scheduler leggeva Sheets ~2880 volte/giorno; ora al massimo 288 volte.
+    """
+    global _notifiche_cache, _notifiche_cache_time
+    now = datetime.now(TIMEZONE)
+    if (
+        _notifiche_cache_time is not None
+        and (now - _notifiche_cache_time).total_seconds() < _NOTIFICHE_TTL
+    ):
+        return _notifiche_cache
+    _notifiche_cache = await asyncio.to_thread(get_notifiche_settings)
+    _notifiche_cache_time = now
+    return _notifiche_cache
+
+
 async def scheduler_loop() -> None:
     """
-    Scheduler per-utente: ogni 30s legge le impostazioni dal foglio Notifiche
-    e invia i reminder agli utenti il cui orario configurato coincide con l'ora
-    attuale, solo se non hanno già registrato ingresso/uscita oggi e il reminder
-    non è già stato inviato nella stessa giornata.
+    Scheduler per-utente ottimizzato:
+    - Ogni 30s controlla se l'ora attuale coincide con un orario reminder.
+    - Carica le impostazioni notifiche dal cache (aggiornato ogni 5 min).
+    - Carica il Registro da Sheets SOLO se almeno un utente ha un reminder
+      attivo in quest'ora, evitando chiamate API inutili.
+    - Non invia il reminder se l'utente ha già timbrato oggi.
+    - Salta sabato e domenica.
     """
-    logger.info("Scheduler loop avviato (controllo ogni 30s, per-utente)")
+    logger.info("Scheduler loop avviato (controllo ogni 30s, per-utente, ottimizzato)")
     try:
         while True:
             try:
                 now = datetime.now(TIMEZONE)
-                # Salta weekend
-                if now.weekday() < 5:
+                if now.weekday() < 5:  # lunedì-venerdì
                     hhmm = now.strftime("%H:%M")
                     today = now.strftime("%d.%m.%Y")
                     today_date = now.date()
 
-                    # Carica settings e registro in thread separati
-                    settings = await asyncio.to_thread(get_notifiche_settings)
-                    if settings:
+                    settings = await _get_notifiche_cached()
+
+                    # Controlla se c'è almeno un reminder attivo per quest'ora
+                    needs_ingresso = [
+                        (uid, cfg) for uid, cfg in settings.items()
+                        if cfg["reminder_ingresso"]
+                        and cfg["orario_ingresso"] == hhmm
+                        and _sent_ingresso_today.get(uid) != today_date
+                    ]
+                    needs_uscita = [
+                        (uid, cfg) for uid, cfg in settings.items()
+                        if cfg["reminder_uscita"]
+                        and cfg["orario_uscita"] == hhmm
+                        and _sent_uscita_today.get(uid) != today_date
+                    ]
+
+                    # Legge il Registro solo se serve davvero
+                    if needs_ingresso or needs_uscita:
                         sheet_reg = await asyncio.to_thread(get_sheet, "Registro")
                         reg_rows = await asyncio.to_thread(sheet_reg.get_all_values)
-
-                        # Set di chi ha già fatto ingresso/uscita oggi
                         entered_today = {
                             row[1] for row in reg_rows[1:]
                             if len(row) > 2 and row[0] == today and row[2]
@@ -1099,41 +1138,24 @@ async def scheduler_loop() -> None:
                             if len(row) > 4 and row[0] == today and row[4]
                         }
 
-                        for uid, cfg in settings.items():
-                            user_str = cfg["nome"]
-                            # Cerca la stringa "Nome | ID" usata nel Registro
-                            # (cerca per ID nella parte finale)
-                            user_key = next(
-                                (s for s in entered_today | exited_today
-                                 if s.endswith(f"| {uid}")),
-                                None
-                            )
+                        for uid, cfg in needs_ingresso:
+                            has_entered = any(s.endswith(f"| {uid}") for s in entered_today)
+                            if not has_entered:
+                                await send_reminder(
+                                    uid,
+                                    f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'ingresso!"
+                                )
+                            _sent_ingresso_today[uid] = today_date
 
-                            # --- Reminder ingresso ---
-                            if (cfg["reminder_ingresso"]
-                                    and hhmm == cfg["orario_ingresso"]
-                                    and _sent_ingresso_today.get(uid) != today_date):
-                                # Non ha ancora fatto ingresso oggi?
-                                has_entered = any(s.endswith(f"| {uid}") for s in entered_today)
-                                if not has_entered:
-                                    await send_reminder(
-                                        uid,
-                                        f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'ingresso!"
-                                    )
-                                    _sent_ingresso_today[uid] = today_date
-
-                            # --- Reminder uscita ---
-                            if (cfg["reminder_uscita"]
-                                    and hhmm == cfg["orario_uscita"]
-                                    and _sent_uscita_today.get(uid) != today_date):
-                                has_entered = any(s.endswith(f"| {uid}") for s in entered_today)
-                                has_exited = any(s.endswith(f"| {uid}") for s in exited_today)
-                                if has_entered and not has_exited:
-                                    await send_reminder(
-                                        uid,
-                                        f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'uscita!"
-                                    )
-                                    _sent_uscita_today[uid] = today_date
+                        for uid, cfg in needs_uscita:
+                            has_entered = any(s.endswith(f"| {uid}") for s in entered_today)
+                            has_exited = any(s.endswith(f"| {uid}") for s in exited_today)
+                            if has_entered and not has_exited:
+                                await send_reminder(
+                                    uid,
+                                    f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'uscita!"
+                                )
+                            _sent_uscita_today[uid] = today_date
 
             except asyncio.CancelledError:
                 raise
@@ -1153,9 +1175,9 @@ def _build_notif_kb_user(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
     stato_in = "✅ ON" if cfg["reminder_ingresso"] else "❌ OFF"
     stato_out = "✅ ON" if cfg["reminder_uscita"] else "❌ OFF"
     kb.button(text=f"🕓 Ingresso: {stato_in}", callback_data=f"notif:toggle_in:{uid}")
-    kb.button(text=f"⏰ Orario: {cfg['orario_ingresso']}", callback_data=f"notif:set_orario_in:{uid}")
+    kb.button(text=f"⏰ Orario ingresso: {cfg['orario_ingresso']}", callback_data=f"notif:set_orario_in:{uid}")
     kb.button(text=f"🚪 Uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
-    kb.button(text=f"⏰ Orario: {cfg['orario_uscita']}", callback_data=f"notif:set_orario_out:{uid}")
+    kb.button(text=f"⏰ Orario uscita: {cfg['orario_uscita']}", callback_data=f"notif:set_orario_out:{uid}")
     kb.adjust(2, 2)
     return kb.as_markup()
 
@@ -1465,8 +1487,9 @@ async def webhook(request: Request):
 
 
 @app.get("/")
-@app.head("/")   # Render usa HEAD / per verificare che il servizio sia vivo
 async def health_check():
+    # FastAPI risponde automaticamente alle richieste HEAD su route GET.
+    # Non serve @app.head() separato.
     return {"status": "running", "webhook_url": WEBHOOK_URL or "NON IMPOSTATO"}
 
 
