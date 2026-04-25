@@ -1172,13 +1172,13 @@ async def scheduler_loop() -> None:
 # ============================================================
 def _build_notif_kb_user(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    stato_in = "✅ ON" if cfg["reminder_ingresso"] else "❌ OFF"
-    stato_out = "✅ ON" if cfg["reminder_uscita"] else "❌ OFF"
-    kb.button(text=f"🕓 Ingresso: {stato_in}", callback_data=f"notif:toggle_in:{uid}")
-    kb.button(text=f"⏰ Orario: {cfg['orario_ingresso']}", callback_data=f"notif:set_orario_in:{uid}")
-    kb.button(text=f"🚪 Uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
-    kb.button(text=f"⏰ Orario: {cfg['orario_uscita']}", callback_data=f"notif:set_orario_out:{uid}")
-    kb.adjust(2, 2)
+    stato_in = "✅ Attivo" if cfg["reminder_ingresso"] else "❌ Disattivo"
+    stato_out = "✅ Attivo" if cfg["reminder_uscita"] else "❌ Disattivo"
+    kb.button(text=f"🕓 Reminder ingresso: {stato_in}", callback_data=f"notif:toggle_in:{uid}")
+    kb.button(text=f"⏰ Orario ingresso: {cfg['orario_ingresso']}  ✏️", callback_data=f"notif:set_orario_in:{uid}")
+    kb.button(text=f"🚪 Reminder uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
+    kb.button(text=f"⏰ Orario uscita: {cfg['orario_uscita']}  ✏️", callback_data=f"notif:set_orario_out:{uid}")
+    kb.adjust(1)  # un bottone per riga: testo completo visibile su mobile
     return kb.as_markup()
 
 
@@ -1250,14 +1250,14 @@ async def notif_admin_user_handler(cb: CallbackQuery):
 
 def _build_notif_kb_admin(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    stato_in = "✅ ON" if cfg["reminder_ingresso"] else "❌ OFF"
-    stato_out = "✅ ON" if cfg["reminder_uscita"] else "❌ OFF"
-    kb.button(text=f"🕓 Ingresso: {stato_in}", callback_data=f"notif:toggle_in:{uid}")
-    kb.button(text=f"⏰ Orario: {cfg['orario_ingresso']}", callback_data=f"notif:set_orario_in:{uid}")
-    kb.button(text=f"🚪 Uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
-    kb.button(text=f"⏰ Orario: {cfg['orario_uscita']}", callback_data=f"notif:set_orario_out:{uid}")
+    stato_in = "✅ Attivo" if cfg["reminder_ingresso"] else "❌ Disattivo"
+    stato_out = "✅ Attivo" if cfg["reminder_uscita"] else "❌ Disattivo"
+    kb.button(text=f"🕓 Reminder ingresso: {stato_in}", callback_data=f"notif:toggle_in:{uid}")
+    kb.button(text=f"⏰ Orario ingresso: {cfg['orario_ingresso']}  ✏️", callback_data=f"notif:set_orario_in:{uid}")
+    kb.button(text=f"🚪 Reminder uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
+    kb.button(text=f"⏰ Orario uscita: {cfg['orario_uscita']}  ✏️", callback_data=f"notif:set_orario_out:{uid}")
     kb.button(text="🔙 Torna alla lista", callback_data="notif:admin_list")
-    kb.adjust(2, 2, 1)
+    kb.adjust(1)  # un bottone per riga: testo completo visibile su mobile
     return kb.as_markup()
 
 
