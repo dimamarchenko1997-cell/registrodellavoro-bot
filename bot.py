@@ -41,7 +41,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")          # FIX #9 – es. https://tuo-dom
 PORT = int(os.getenv("PORT", 8000))
 TIMEZONE = pytz.timezone("Europe/Rome")
 
-# FIX #8 – fail veloce se il token manca, prima di creare qualsiasi oggett
+# FIX #8 – fail veloce se il token manca, prima di creare qualsiasi oggetto
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN non impostato nelle variabili d'ambiente.")
 
@@ -486,6 +486,7 @@ main_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="🚪 Uscita")],
         [KeyboardButton(text="📝 Richiesta permessi")],
         [KeyboardButton(text="📄 Riepilogo")],
+        [KeyboardButton(text="🔔 Mie Notifiche")],
         [KeyboardButton(text="📘 Istruzioni Bot")],
     ],
     resize_keyboard=True,
@@ -1159,7 +1160,7 @@ def _build_notif_kb_user(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-@dp.message(F.text == "/mienotifiche")
+@dp.message(F.text.in_({"/mienotifiche", "🔔 Mie Notifiche"}))
 async def mienotifiche_handler(message: Message):
     uid = message.from_user.id
     settings = await asyncio.to_thread(get_notifiche_settings)
