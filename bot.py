@@ -290,15 +290,28 @@ def _sync_save_permesso(user: types.User, start_date: str, end_date: str, reason
         return False
 
 
-async def get_riepilogo(user: types.User) -> Optional[io.StringIO]:
-    return await asyncio.to_thread(_sync_get_riepilogo, user)
+async def get_riepilogo(user: types.User, year: int, month: int) -> Optional[io.StringIO]:
+    """Restituisce il CSV delle presenze dell'utente filtrato per anno e mese."""
+    return await asyncio.to_thread(_sync_get_riepilogo, user, year, month)
 
-def _sync_get_riepilogo(user: types.User) -> Optional[io.StringIO]:
+def _sync_get_riepilogo(user: types.User, year: int, month: int) -> Optional[io.StringIO]:
+    """
+    Filtra le righe del foglio Registro per l'utente, anno e mese selezionati.
+    La data è in formato 'DD.MM.YYYY', quindi il filtro controlla che la parte
+    MM.YYYY corrisponda al mese/anno scelto.
+    """
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
         user_id = f"{user.full_name} | {user.id}"
-        user_rows = [row for row in rows if len(row) > 1 and row[1] == user_id]
+        month_filter = f"{month:02d}.{year}"          # es. "03.2025"
+        user_rows = [
+            row for row in rows[1:]
+            if len(row) > 1
+            and row[1] == user_id
+            and len(row[0]) >= 7
+            and row[0][3:10] == month_filter           # "DD.MM.YYYY" → posizioni 3-9
+        ]
         if not user_rows:
             return None
         output = io.StringIO()
@@ -592,25 +605,110 @@ async def permessi_reason(message: Message, state: FSMContext):
 
 
 # ============================================================
-# Handlers – Riepilogo
+# Handlers – Riepilogo (selezione anno → mese → CSV)
 # ============================================================
+
+def _build_year_keyboard() -> types.InlineKeyboardMarkup:
+    """
+    Mostra gli ultimi 3 anni come bottoni inline.
+    L'anno corrente è evidenziato con 🔵.
+    """
+    kb = InlineKeyboardBuilder()
+    current_year = datetime.now(TIMEZONE).year
+    for y in range(current_year, current_year - 3, -1):
+        label = f"🔵 {y}" if y == current_year else str(y)
+        kb.button(text=label, callback_data=f"riepilogo:year:{y}")
+    kb.adjust(3)
+    return kb.as_markup()
+
+
+def _build_month_keyboard(year: int) -> types.InlineKeyboardMarkup:
+    """
+    Mostra i 12 mesi in una griglia 3×4.
+    Il mese corrente (se l'anno è quello corrente) è evidenziato con 🔵.
+    """
+    kb = InlineKeyboardBuilder()
+    nomi_mesi = [
+        "Gen", "Feb", "Mar", "Apr", "Mag", "Giu",
+        "Lug", "Ago", "Set", "Ott", "Nov", "Dic",
+    ]
+    now = datetime.now(TIMEZONE)
+    for i, nome in enumerate(nomi_mesi, start=1):
+        is_current = (year == now.year and i == now.month)
+        label = f"🔵 {nome}" if is_current else nome
+        kb.button(text=label, callback_data=f"riepilogo:month:{year}:{i}")
+    kb.button(text="🔙 Cambia anno", callback_data="riepilogo:back_year")
+    kb.adjust(3, 3, 3, 3, 1)
+    return kb.as_markup()
+
+
 @dp.message(F.text == "📄 Riepilogo")
 async def riepilogo_handler(message: Message):
-    # FIX #1 – già async (get_riepilogo usa asyncio.to_thread internamente)
-    riepilogo = await get_riepilogo(message.from_user)
+    """Passo 1: mostra la selezione dell'anno."""
+    await message.answer(
+        "📅 <b>Seleziona l'anno</b> per cui vuoi vedere il riepilogo presenze:",
+        reply_markup=_build_year_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "riepilogo:back_year")
+async def riepilogo_back_year(cb: CallbackQuery):
+    """Torna alla selezione dell'anno."""
+    await cb.message.edit_text(
+        "📅 <b>Seleziona l'anno</b> per cui vuoi vedere il riepilogo presenze:",
+        reply_markup=_build_year_keyboard(),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("riepilogo:year:"))
+async def riepilogo_year_handler(cb: CallbackQuery):
+    """Passo 2: ricevuto l'anno, mostra la selezione del mese."""
+    year = int(cb.data.split(":")[2])
+    await cb.message.edit_text(
+        f"📅 Anno selezionato: <b>{year}</b>\n\nOra seleziona il <b>mese</b>:",
+        reply_markup=_build_month_keyboard(year),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("riepilogo:month:"))
+async def riepilogo_month_handler(cb: CallbackQuery):
+    """Passo 3: ricevuto il mese, recupera i dati e invia il CSV."""
+    parts = cb.data.split(":")
+    year, month = int(parts[2]), int(parts[3])
+    nome_mese = mese_nome(month)
+
+    await cb.answer(f"⏳ Carico {nome_mese} {year}…")
+
+    riepilogo = await get_riepilogo(cb.from_user, year, month)
+
     if not riepilogo:
-        await message.answer("❌ Nessun dato trovato nel tuo registro.", reply_markup=main_kb)
+        await cb.message.edit_text(
+            f"❌ Nessuna registrazione trovata per <b>{nome_mese} {year}</b>.",
+            reply_markup=_build_month_keyboard(year),
+        )
         return
 
     csv_bytes = riepilogo.getvalue().encode("utf-8")
-    input_file = BufferedInputFile(csv_bytes, filename="riepilogo_registro.csv")
+    filename = f"riepilogo_{year}_{month:02d}.csv"
+    input_file = BufferedInputFile(csv_bytes, filename=filename)
 
     try:
-        await bot.send_document(chat_id=message.chat.id, document=input_file)
-        await message.answer("✅ Riepilogo inviato!", reply_markup=main_kb)
+        await cb.message.edit_text(
+            f"✅ Riepilogo <b>{nome_mese} {year}</b> pronto, lo invio…"
+        )
+        await bot.send_document(
+            chat_id=cb.message.chat.id,
+            document=input_file,
+            caption=f"📄 Presenze <b>{nome_mese} {year}</b>",
+        )
     except Exception as e:
         logger.exception("Errore invio riepilogo: %s", e)
-        await message.answer("❌ Errore nell'invio del riepilogo. Contatta l'amministratore.", reply_markup=main_kb)
+        await cb.message.answer(
+            "❌ Errore nell'invio del riepilogo. Contatta l'amministratore.",
+            reply_markup=main_kb,
+        )
 
 
 # ============================================================
