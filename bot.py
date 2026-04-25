@@ -1153,9 +1153,9 @@ def _build_notif_kb_user(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
     stato_in = "✅ ON" if cfg["reminder_ingresso"] else "❌ OFF"
     stato_out = "✅ ON" if cfg["reminder_uscita"] else "❌ OFF"
     kb.button(text=f"🕓 Ingresso: {stato_in}", callback_data=f"notif:toggle_in:{uid}")
-    kb.button(text=f"⏰ Orario ingresso: {cfg['orario_ingresso']}", callback_data=f"notif:set_orario_in:{uid}")
+    kb.button(text=f"⏰ Orario: {cfg['orario_ingresso']}", callback_data=f"notif:set_orario_in:{uid}")
     kb.button(text=f"🚪 Uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
-    kb.button(text=f"⏰ Orario uscita: {cfg['orario_uscita']}", callback_data=f"notif:set_orario_out:{uid}")
+    kb.button(text=f"⏰ Orario: {cfg['orario_uscita']}", callback_data=f"notif:set_orario_out:{uid}")
     kb.adjust(2, 2)
     return kb.as_markup()
 
