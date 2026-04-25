@@ -1,4 +1,4 @@
-import os
+iimport os
 import asyncio
 import calendar
 import json
@@ -1024,18 +1024,81 @@ async def remindtest_handler(message: Message):
 
 
 # ============================================================
+# Comando /status (solo admin) – diagnostica dal bot
+# ============================================================
+@dp.message(F.text == "/status")
+async def status_handler(message: Message):
+    """
+    Comando di diagnostica: riepiloga lo stato di tutte le componenti.
+    Utile per capire cosa non funziona senza dover leggere i log di Render.
+    Solo gli admin possono usarlo.
+    """
+    if message.from_user.id not in ADMINS:
+        await message.answer("❌ Non hai i permessi.")
+        return
+
+    lines = ["<b>🔍 Diagnostica Bot</b>\n"]
+
+    # 1. Token
+    lines.append(f"🔑 <b>Token:</b> {'✅ presente' if TOKEN else '❌ MANCANTE'}")
+
+    # 2. Webhook registrato su Telegram
+    try:
+        wh = await bot.get_webhook_info()
+        if wh.url:
+            lines.append(f"🌐 <b>Webhook URL:</b> ✅ {wh.url}")
+            lines.append(f"   Pending updates: {wh.pending_update_count}")
+            if wh.last_error_message:
+                lines.append(f"   ⚠️ Ultimo errore Telegram: {wh.last_error_message}")
+        else:
+            lines.append("🌐 <b>Webhook URL:</b> ❌ NON impostato su Telegram!\n"
+                         "   → Imposta WEBHOOK_URL nelle env vars di Render.")
+    except Exception as e:
+        lines.append(f"🌐 <b>Webhook:</b> ❌ errore lettura ({e})")
+
+    # 3. Variabile WEBHOOK_URL locale
+    lines.append(f"⚙️ <b>WEBHOOK_URL env:</b> {'✅ ' + WEBHOOK_URL if WEBHOOK_URL else '❌ MANCANTE'}")
+
+    # 4. Google Sheets
+    try:
+        await asyncio.to_thread(get_sheet, "Registro")
+        lines.append("📊 <b>Google Sheets:</b> ✅ connesso")
+    except Exception as e:
+        lines.append(f"📊 <b>Google Sheets:</b> ❌ errore: {e}")
+
+    # 5. Credenziali Google
+    if CREDENTIALS_JSON:
+        lines.append("🔐 <b>Google Credentials:</b> ✅ da variabile JSON")
+    elif CREDENTIALS_FILE:
+        lines.append(f"🔐 <b>Google Credentials:</b> ✅ da file ({CREDENTIALS_FILE})")
+    else:
+        lines.append("🔐 <b>Google Credentials:</b> ❌ MANCANTI (né JSON né FILE)")
+
+    # 6. Sheet ID
+    lines.append(f"🗂 <b>Sheet ID:</b> {'✅ presente' if SHEET_ID else '❌ MANCANTE'}")
+
+    await message.answer("\n".join(lines))
+
+
+# ============================================================
 # FastAPI + lifecycle
 # ============================================================
 async def on_startup() -> None:
     await asyncio.to_thread(init_sheets)
 
-    # FIX #9 – registra il webhook su Telegram all'avvio
+    # Registra il webhook su Telegram
     if WEBHOOK_URL:
         webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
-        await bot.set_webhook(webhook_endpoint)
-        logger.info("Webhook impostato: %s", webhook_endpoint)
+        try:
+            await bot.set_webhook(webhook_endpoint, drop_pending_updates=True)
+            logger.info("Webhook impostato: %s", webhook_endpoint)
+        except Exception as e:
+            logger.error("Errore impostazione webhook: %s", e)
     else:
-        logger.warning("WEBHOOK_URL non impostato: il webhook NON è stato registrato su Telegram.")
+        logger.warning(
+            "WEBHOOK_URL non impostato: il webhook NON è stato registrato su Telegram.\n"
+            "Imposta la variabile WEBHOOK_URL = https://<tuo-app>.onrender.com nelle env vars di Render."
+        )
 
     asyncio.create_task(scheduler_loop())
     logger.info("Startup completato.")
@@ -1064,8 +1127,41 @@ async def webhook(request: Request):
 
 
 @app.get("/")
+@app.head("/")   # Render usa HEAD / per verificare che il servizio sia vivo
 async def health_check():
-    return "Bot is running"
+    return {"status": "running", "webhook_url": WEBHOOK_URL or "NON IMPOSTATO"}
+
+
+@app.get("/debug")
+async def debug_endpoint():
+    """
+    Endpoint pubblico di diagnostica rapida.
+    Apri https://<tuo-app>.onrender.com/debug nel browser per vedere lo stato.
+    """
+    result = {
+        "bot_token_set": bool(TOKEN),
+        "webhook_url_env": WEBHOOK_URL or "MANCANTE",
+        "sheet_id_set": bool(SHEET_ID),
+        "credentials_source": (
+            "json_env" if CREDENTIALS_JSON
+            else ("file" if CREDENTIALS_FILE else "MANCANTE")
+        ),
+    }
+    try:
+        wh = await bot.get_webhook_info()
+        result["telegram_webhook_url"] = wh.url or "NON IMPOSTATO"
+        result["telegram_pending_updates"] = wh.pending_update_count
+        result["telegram_last_error"] = wh.last_error_message or "nessuno"
+    except Exception as e:
+        result["telegram_webhook_error"] = str(e)
+
+    try:
+        await asyncio.to_thread(get_sheet, "Registro")
+        result["google_sheets"] = "ok"
+    except Exception as e:
+        result["google_sheets"] = f"ERRORE: {e}"
+
+    return result
 
 
 # ============================================================
