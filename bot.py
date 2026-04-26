@@ -1541,19 +1541,21 @@ def _handle_task_exception(loop, context):
 
 
 async def on_startup() -> None:
+    global _sheets_semaphore
+    # Crea il semaforo DENTRO l'event loop attivo (non a livello modulo).
+    # asyncio.Semaphore() creato prima dell'event loop causa RuntimeError
+    # su Python 3.10+ e blocca il bot dopo pochi minuti.
+    _sheets_semaphore = asyncio.Semaphore(3)
+
     # Registra handler globale per eccezioni nei task
     loop = asyncio.get_event_loop()
     loop.set_exception_handler(_handle_task_exception)
 
-     # Init Sheets con timeout breve per evitare boot bloccanti.
-    # In caso di errore/timeout il bot parte comunque.
     try:
-        await sheets_call(init_sheets, timeout=10.0)
-        logger.info("Init Sheets completato.")
-    except asyncio.TimeoutError:
-        logger.error("Init Sheets in timeout: proseguo senza bloccare il bot.")
+        await sheets_call(init_sheets)
     except Exception as e:
-        logger.exception("Init Sheets fallito: %s", e)
+        logger.error("Init Sheets fallito (bot parte comunque): %s", e)
+
 
     # Registra il webhook su Telegram
     if WEBHOOK_URL:
