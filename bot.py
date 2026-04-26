@@ -1,4 +1,4 @@
-import os
+eimport ose
 import asyncio
 import calendar
 import json
@@ -1545,7 +1545,15 @@ async def on_startup() -> None:
     loop = asyncio.get_event_loop()
     loop.set_exception_handler(_handle_task_exception)
 
-    await sheets_call(init_sheets)
+       # Non bloccare l'avvio dell'app se Google Sheets è lento/non disponibile:
+    # se questa fase fallisce, il bot può comunque rispondere ai comandi base
+    # e fornire diagnostica (/status, /debug) invece di far terminare il processo.
+    try:
+        await sheets_call(init_sheets, timeout=60.0)
+    except asyncio.TimeoutError:
+        logger.error("Init Sheets in timeout durante startup: avvio continuo senza init completo.")
+    except Exception as e:
+        logger.exception("Init Sheets fallito durante startup: %s", e)
 
     # Registra il webhook su Telegram
     if WEBHOOK_URL:
