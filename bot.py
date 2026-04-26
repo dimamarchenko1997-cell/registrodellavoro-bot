@@ -1437,6 +1437,34 @@ async def remindtest_handler(message: Message):
 
 
 # ============================================================
+# Fallback handler – cattura messaggi non gestiti
+# ============================================================
+@dp.message()
+async def fallback_handler(message: Message, state: FSMContext):
+    """
+    Cattura qualsiasi messaggio che non ha trovato un handler.
+    Questo succede principalmente quando:
+    - L'utente è in uno stato FSM (es. aspetta posizione) e preme un bottone del menu
+    - L'utente manda un comando sconosciuto
+    In entrambi i casi: azzera lo stato e rimanda al menu principale.
+    """
+    current_state = await state.get_state()
+    if current_state is not None:
+        # Utente era in uno stato FSM – lo azzeriamo e lo riportiamo al menu
+        await state.clear()
+        await message.answer(
+            "⚠️ Operazione annullata. Scegli un'opzione dal menu:",
+            reply_markup=main_kb
+        )
+    else:
+        # Messaggio sconosciuto fuori da qualsiasi stato
+        await message.answer(
+            "Non ho capito. Usa i bottoni del menu oppure /start per ricominciare.",
+            reply_markup=main_kb
+        )
+
+
+# ============================================================
 # Comando /status (solo admin) – diagnostica dal bot
 # ============================================================
 @dp.message(F.text == "/status")
