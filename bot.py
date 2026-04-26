@@ -1579,7 +1579,10 @@ async def on_startup() -> None:
 async def lifespan(app: FastAPI):
     await on_startup()
     yield
-    await bot.delete_webhook()
+    # NON cancellare il webhook allo shutdown: se Render riavvia il processo
+    # per un deploy, il webhook sparisce e il bot smette di ricevere messaggi
+    # finché non viene re-impostato manualmente.
+    # Il webhook viene re-impostato automaticamente al prossimo avvio.
     logger.info("Shutdown completato.")
 
 
