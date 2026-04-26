@@ -54,17 +54,13 @@ bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
 # Semaforo: max 3 chiamate a Google Sheets contemporanee.
-# Senza questo il thread pool si esaurisce quando Sheets è lento
-# e il bot smette di rispondere a qualsiasi comando.
 _sheets_semaphore = asyncio.Semaphore(3)
 
 
 async def sheets_call(fn, *args, timeout: float = 15.0):
     """
-    Esegue una funzione sincrona (chiamata a Sheets) in un thread separato
-    con semaforo (max 3 contemporanee) e timeout (default 15s).
-    Se Sheets non risponde entro il timeout, lancia TimeoutError invece
-    di bloccare il thread per sempre.
+    Esegue fn in un thread separato con semaforo (max 3) e timeout (15s).
+    Se Sheets non risponde, resetta il client del thread e lancia TimeoutError.
     """
     async with _sheets_semaphore:
         try:
@@ -73,11 +69,10 @@ async def sheets_call(fn, *args, timeout: float = 15.0):
                 timeout=timeout
             )
         except asyncio.TimeoutError:
-            logger.error("Timeout chiamata Sheets: %s(%s)", fn.__name__, args)
-            # Reset client gspread: la connessione potrebbe essere corrotta
-            global _gspread_client
-            _gspread_client = None
+            logger.error("Timeout chiamata Sheets: %s", fn.__name__)
+            _reset_client()
             raise
+
 
 # Traccia i reminder già inviati oggi per ogni utente {user_id: date}
 _sent_ingresso_today: Dict[int, date] = {}
@@ -85,28 +80,26 @@ _sent_uscita_today: Dict[int, date] = {}
 
 
 # ============================================================
-# FIX #2 – Google Sheets: client con caching
+# Google Sheets: client thread-local (thread-safe)
 # ============================================================
-_gspread_client: Optional[gspread.Client] = None
+# gspread usa requests.Session che NON è thread-safe.
+# Condividere un unico client globale tra più thread causa
+# corruzione silente della sessione HTTP -> bot che si blocca
+# senza errori dopo pochi minuti di utilizzo.
+# Soluzione: ogni thread ha il proprio client (threading.local).
+import threading
+_thread_local = threading.local()
 
-def _get_client() -> gspread.Client:
-    """
-    Restituisce il client gspread, creandolo solo la prima volta (caching).
-    Prima era ricreato ad ogni chiamata a get_sheet(), causando autenticazione
-    ripetuta e lentezza. Ora viene istanziato una volta sola.
-    """
-    global _gspread_client
-    if _gspread_client is not None:
-        return _gspread_client
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
+
+def _build_creds():
+    """Costruisce le credenziali Google (chiamato una volta per thread)."""
     if not (CREDENTIALS_JSON or CREDENTIALS_FILE):
         raise ValueError("Devi impostare GOOGLE_CREDENTIALS o GOOGLE_CREDENTIALS_FILE.")
-
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
     if CREDENTIALS_JSON:
         try:
             credentials_dict = json.loads(CREDENTIALS_JSON)
@@ -115,30 +108,39 @@ def _get_client() -> gspread.Client:
             raise
         if "private_key" in credentials_dict and isinstance(credentials_dict["private_key"], str):
             credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
-        creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
-    else:
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scope)
+        return Credentials.from_service_account_info(credentials_dict, scopes=SCOPES)
+    return Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
 
-    _gspread_client = gspread.authorize(creds)
-    return _gspread_client
+
+def _get_client() -> gspread.Client:
+    """Restituisce il client gspread del thread corrente (thread-safe)."""
+    if not hasattr(_thread_local, "client") or _thread_local.client is None:
+        _thread_local.client = gspread.authorize(_build_creds())
+        logger.debug("Nuovo client gspread per thread %s", threading.current_thread().name)
+    return _thread_local.client
+
+
+def _reset_client():
+    """Azzera il client del thread corrente dopo errore o timeout."""
+    if hasattr(_thread_local, "client"):
+        _thread_local.client = None
 
 
 def get_sheet(sheet_name: str = "Registro") -> Worksheet:
-    """Restituisce la worksheet richiesta usando il client con caching."""
+    """Restituisce la worksheet usando il client thread-local."""
     try:
         return _get_client().open_by_key(SHEET_ID).worksheet(sheet_name)
     except gspread.exceptions.APIError as e:
-        # Se il token è scaduto (errore 401) azzera il client per forzare
-        # la riautenticazione al prossimo tentativo.
         if e.response.status_code == 401:
-            global _gspread_client
-            _gspread_client = None
-            logger.warning("Token gspread scaduto, client resettato per riautenticazione.")
+            _reset_client()
+            logger.warning("Token scaduto, client resettato (thread %s).", threading.current_thread().name)
         logger.exception("Errore aprendo il foglio '%s': %s", sheet_name, e)
         raise
     except Exception as e:
+        _reset_client()  # reset su qualsiasi errore
         logger.exception("Errore aprendo il foglio '%s': %s", sheet_name, e)
         raise
+
 
 
 # ============================================================
