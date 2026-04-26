@@ -21,6 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 import gspread
@@ -36,15 +37,13 @@ TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("GOOGLE_SHEETS_ID")
 CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")          # FIX #9 – es. https://tuo-dominio.com/webhook
 PORT = int(os.getenv("PORT", 8000))
 TIMEZONE = pytz.timezone("Europe/Rome")
 
+# FIX #8 – fail veloce se il token manca, prima di creare qualsiasi oggetto
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN non impostato nelle variabili d'ambiente.")
-
-if not SHEET_ID:
-    raise RuntimeError("GOOGLE_SHEETS_ID non impostato nelle variabili d'ambiente.")
 
 ADMINS = {614102287}
 
@@ -54,18 +53,23 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
+# Traccia i reminder già inviati oggi per ogni utente {user_id: date}
 _sent_ingresso_today: Dict[int, date] = {}
 _sent_uscita_today: Dict[int, date] = {}
 
+
 # ============================================================
-# Google Sheets client con caching
+# FIX #2 – Google Sheets: client con caching
 # ============================================================
 _gspread_client: Optional[gspread.Client] = None
 
-
 def _get_client() -> gspread.Client:
+    """
+    Restituisce il client gspread, creandolo solo la prima volta (caching).
+    Prima era ricreato ad ogni chiamata a get_sheet(), causando autenticazione
+    ripetuta e lentezza. Ora viene istanziato una volta sola.
+    """
     global _gspread_client
-
     if _gspread_client is not None:
         return _gspread_client
 
@@ -78,7 +82,11 @@ def _get_client() -> gspread.Client:
     ]
 
     if CREDENTIALS_JSON:
-        credentials_dict = json.loads(CREDENTIALS_JSON)
+        try:
+            credentials_dict = json.loads(CREDENTIALS_JSON)
+        except Exception as e:
+            logger.exception("Errore parsing GOOGLE_CREDENTIALS: %s", e)
+            raise
         if "private_key" in credentials_dict and isinstance(credentials_dict["private_key"], str):
             credentials_dict["private_key"] = credentials_dict["private_key"].replace("\\n", "\n")
         creds = Credentials.from_service_account_info(credentials_dict, scopes=scope)
@@ -90,15 +98,16 @@ def _get_client() -> gspread.Client:
 
 
 def get_sheet(sheet_name: str = "Registro") -> Worksheet:
-    global _gspread_client
-
+    """Restituisce la worksheet richiesta usando il client con caching."""
     try:
         return _get_client().open_by_key(SHEET_ID).worksheet(sheet_name)
     except gspread.exceptions.APIError as e:
-        status_code = getattr(getattr(e, "response", None), "status_code", None)
-        if status_code == 401:
+        # Se il token è scaduto (errore 401) azzera il client per forzare
+        # la riautenticazione al prossimo tentativo.
+        if e.response.status_code == 401:
+            global _gspread_client
             _gspread_client = None
-            logger.warning("Token gspread scaduto, client resettato.")
+            logger.warning("Token gspread scaduto, client resettato per riautenticazione.")
         logger.exception("Errore aprendo il foglio '%s': %s", sheet_name, e)
         raise
     except Exception as e:
@@ -107,11 +116,11 @@ def get_sheet(sheet_name: str = "Registro") -> Worksheet:
 
 
 # ============================================================
-# Zone lavoro cache
+# FIX #3 – Caching work_locations con TTL (5 minuti)
 # ============================================================
 _work_locations_cache: Optional[Dict[str, Tuple[float, float]]] = None
 _work_locations_cache_time: Optional[datetime] = None
-_CACHE_TTL_SECONDS = 300
+_CACHE_TTL_SECONDS = 300  # 5 minuti
 
 WORK_LOCATIONS = {
     "Ufficio Centrale": (45.6204762, 9.2401744),
@@ -120,6 +129,12 @@ MAX_DISTANCE_METERS = 200
 
 
 def get_work_locations() -> Dict[str, Tuple[float, float]]:
+    """
+    Legge ZoneLavoro da Sheets con caching in memoria (TTL 5 minuti).
+    Prima questa funzione chiamava Sheets ad ogni check di posizione (ingresso/uscita),
+    sprecando quota API e aggiungendo centinaia di ms di latenza. Ora le zone vengono
+    recuperate al massimo ogni 5 minuti.
+    """
     global _work_locations_cache, _work_locations_cache_time
 
     now = datetime.now(TIMEZONE)
@@ -135,7 +150,6 @@ def get_work_locations() -> Dict[str, Tuple[float, float]]:
         sheet = get_sheet("ZoneLavoro")
         rows = sheet.get_all_values()
         locs: Dict[str, Tuple[float, float]] = {}
-
         for row in rows[1:]:
             if len(row) >= 3:
                 name = row[0].strip()
@@ -157,6 +171,7 @@ def get_work_locations() -> Dict[str, Tuple[float, float]]:
 
 
 def _invalidate_locations_cache() -> None:
+    """Invalida il cache zone dopo un'aggiunta, modifica o cancellazione."""
     global _work_locations_cache, _work_locations_cache_time
     _work_locations_cache = None
     _work_locations_cache_time = None
@@ -166,7 +181,7 @@ def save_new_zone(name: str, lat: float, lon: float) -> bool:
     try:
         sheet = get_sheet("ZoneLavoro")
         sheet.append_row([name, str(lat), str(lon)])
-        _invalidate_locations_cache()
+        _invalidate_locations_cache()  # FIX #3 – invalida cache dopo modifica
         return True
     except Exception as e:
         logger.exception("Errore salvataggio zona: %s", e)
@@ -180,7 +195,7 @@ def update_zone_name(old_name: str, new_name: str) -> bool:
         for i, row in enumerate(rows[1:], start=2):
             if len(row) >= 3 and row[0] == old_name:
                 sheet.update_cell(i, 1, new_name)
-                _invalidate_locations_cache()
+                _invalidate_locations_cache()  # FIX #3
                 return True
         return False
     except Exception as e:
@@ -195,7 +210,7 @@ def delete_zone(name: str) -> bool:
         for i, row in enumerate(rows[1:], start=2):
             if len(row) >= 3 and row[0] == name:
                 sheet.delete_rows(i)
-                _invalidate_locations_cache()
+                _invalidate_locations_cache()  # FIX #3
                 return True
         return False
     except Exception as e:
@@ -204,11 +219,16 @@ def delete_zone(name: str) -> bool:
 
 
 # ============================================================
-# Operazioni Registro / Permessi
+# FIX #1 – Wrapping delle chiamate sync in asyncio.to_thread
 # ============================================================
+# Tutte le funzioni che chiamano Google Sheets sono sincrone (bloccanti).
+# Chiamarle direttamente da handler async blocca l'event loop di aiogram,
+# impedendo di gestire altri messaggi mentre si aspetta la risposta di Sheets.
+# asyncio.to_thread le esegue in un thread separato senza bloccare il loop.
+
+
 async def async_save_ingresso(user: types.User, time_str: str, location_name: str) -> bool:
     return await asyncio.to_thread(_sync_save_ingresso, user, time_str, location_name)
-
 
 def _sync_save_ingresso(user: types.User, time_str: str, location_name: str) -> bool:
     try:
@@ -217,13 +237,12 @@ def _sync_save_ingresso(user: types.User, time_str: str, location_name: str) -> 
         today = now_local.strftime("%d.%m.%Y")
         user_id = f"{user.full_name} | {user.id}"
         rows = sheet.get_all_values()
-
         for row in rows[1:]:
             if len(row) > 1 and row[0] == today and row[1] == user_id:
                 logger.warning("Ingresso già registrato per %s oggi.", user_id)
                 return False
-
         sheet.append_row([today, user_id, time_str, location_name, "", ""])
+        # Registra l'utente nel foglio Notifiche se non esiste già
         upsert_user_notifiche(user.id, user.full_name)
         return True
     except Exception as e:
@@ -234,7 +253,6 @@ def _sync_save_ingresso(user: types.User, time_str: str, location_name: str) -> 
 async def async_save_uscita(user: types.User, time_str: str, location_name: str) -> bool:
     return await asyncio.to_thread(_sync_save_uscita, user, time_str, location_name)
 
-
 def _sync_save_uscita(user: types.User, time_str: str, location_name: str) -> bool:
     try:
         sheet = get_sheet("Registro")
@@ -242,17 +260,17 @@ def _sync_save_uscita(user: types.User, time_str: str, location_name: str) -> bo
         today = now_local.strftime("%d.%m.%Y")
         user_id = f"{user.full_name} | {user.id}"
         rows = sheet.get_all_values()
-
         for i, row in enumerate(rows[1:], start=2):
             if len(row) > 4 and row[0] == today and row[1] == user_id and not row[4]:
-                col_e = gspread.utils.rowcol_to_a1(i, 5)
-                col_f = gspread.utils.rowcol_to_a1(i, 6)
+                # batch_update invia un'unica richiesta HTTP invece di due
+                # → risparmia ~300ms per ogni registrazione uscita
+                col_e = gspread.utils.rowcol_to_a1(i, 5)  # Es. E5
+                col_f = gspread.utils.rowcol_to_a1(i, 6)  # Es. F5
                 sheet.batch_update([{
-                    "range": f"{col_e}:{col_f}",
-                    "values": [[time_str, location_name]],
+                    'range': f'{col_e}:{col_f}',
+                    'values': [[time_str, location_name]]
                 }])
                 return True
-
         logger.warning("Nessun ingresso trovato per %s oggi.", user_id)
         return False
     except Exception as e:
@@ -263,7 +281,6 @@ def _sync_save_uscita(user: types.User, time_str: str, location_name: str) -> bo
 async def async_save_permesso(user: types.User, start_date: str, end_date: str, reason: str) -> bool:
     return await asyncio.to_thread(_sync_save_permesso, user, start_date, end_date, reason)
 
-
 def _sync_save_permesso(user: types.User, start_date: str, end_date: str, reason: str) -> bool:
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -271,7 +288,6 @@ def _sync_save_permesso(user: types.User, start_date: str, end_date: str, reason
         if end_dt < start_dt:
             logger.warning("Data fine precedente alla data inizio.")
             return False
-
         sheet = get_sheet("Permessi")
         now_local = datetime.now(TIMEZONE)
         created = now_local.strftime("%d.%m.%Y %H:%M")
@@ -284,26 +300,29 @@ def _sync_save_permesso(user: types.User, start_date: str, end_date: str, reason
 
 
 async def get_riepilogo(user: types.User, year: int, month: int) -> Optional[io.StringIO]:
+    """Restituisce il CSV delle presenze dell'utente filtrato per anno e mese."""
     return await asyncio.to_thread(_sync_get_riepilogo, user, year, month)
 
-
 def _sync_get_riepilogo(user: types.User, year: int, month: int) -> Optional[io.StringIO]:
+    """
+    Filtra le righe del foglio Registro per l'utente, anno e mese selezionati.
+    La data è in formato 'DD.MM.YYYY', quindi il filtro controlla che la parte
+    MM.YYYY corrisponda al mese/anno scelto.
+    """
     try:
         sheet = get_sheet("Registro")
         rows = sheet.get_all_values()
         user_id = f"{user.full_name} | {user.id}"
-        month_filter = f"{month:02d}.{year}"
+        month_filter = f"{month:02d}.{year}"          # es. "03.2025"
         user_rows = [
             row for row in rows[1:]
             if len(row) > 1
             and row[1] == user_id
             and len(row[0]) >= 7
-            and row[0][3:10] == month_filter
+            and row[0][3:10] == month_filter           # "DD.MM.YYYY" → posizioni 3-9
         ]
-
         if not user_rows:
             return None
-
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
@@ -320,43 +339,48 @@ def init_sheets() -> None:
         sheet_reg = get_sheet("Registro")
         if not sheet_reg.row_values(1):
             sheet_reg.append_row(["Data", "Utente", "Ingresso ora", "Posizione ingresso", "Uscita ora", "Posizione uscita"])
-
         sheet_perm = get_sheet("Permessi")
         if not sheet_perm.row_values(1):
             sheet_perm.append_row(["Data richiesta", "Utente", "Dal", "Al", "Motivo"])
-
         try:
             sheet_zone = get_sheet("ZoneLavoro")
             if not sheet_zone.row_values(1):
                 sheet_zone.append_row(["Nome", "Latitudine", "Longitudine"])
         except Exception:
-            logger.exception("Errore inizializzazione ZoneLavoro")
-
+            pass
         try:
             sheet_notif = get_sheet("Notifiche")
             if not sheet_notif.row_values(1):
                 sheet_notif.append_row([
                     "Telegram ID", "Nome",
                     "Reminder Ingresso", "Orario Ingresso",
-                    "Reminder Uscita", "Orario Uscita",
+                    "Reminder Uscita", "Orario Uscita"
                 ])
         except Exception:
-            logger.exception("Errore inizializzazione Notifiche")
-
+            pass
         logger.info("Sheets inizializzati.")
     except Exception as e:
         logger.error("Errore init_sheets: %s", e)
 
 
 # ============================================================
-# Notifiche helpers
+# Notifiche sheet helpers
 # ============================================================
+# Struttura foglio "Notifiche":
+# Col A: Telegram ID  B: Nome  C: Reminder Ingresso (TRUE/FALSE)
+# Col D: Orario Ingresso (HH:MM)  E: Reminder Uscita (TRUE/FALSE)
+# Col F: Orario Uscita (HH:MM)
+
 def get_notifiche_settings() -> Dict[int, dict]:
+    """
+    Legge il foglio Notifiche e restituisce un dict {user_id: cfg}.
+    cfg = {nome, reminder_ingresso, orario_ingresso,
+           reminder_uscita, orario_uscita, row_index}
+    """
     try:
         sheet = get_sheet("Notifiche")
         rows = sheet.get_all_values()
         result: Dict[int, dict] = {}
-
         for i, row in enumerate(rows[1:], start=2):
             if len(row) < 6 or not row[0].strip():
                 continue
@@ -364,7 +388,6 @@ def get_notifiche_settings() -> Dict[int, dict]:
                 uid = int(row[0].strip())
             except ValueError:
                 continue
-
             result[uid] = {
                 "nome": row[1],
                 "reminder_ingresso": row[2].strip().upper() == "TRUE",
@@ -373,35 +396,30 @@ def get_notifiche_settings() -> Dict[int, dict]:
                 "orario_uscita": row[5].strip() or "17:00",
                 "row_index": i,
             }
-
         return result
     except Exception as e:
         logger.exception("Errore get_notifiche_settings: %s", e)
         return {}
 
 
-def upsert_user_notifiche(
-    user_id: int,
-    nome: str,
-    reminder_in: bool = True,
-    orario_in: str = "08:00",
-    reminder_out: bool = True,
-    orario_out: str = "17:00",
-) -> bool:
+def upsert_user_notifiche(user_id: int, nome: str,
+                           reminder_in: bool = True, orario_in: str = "08:00",
+                           reminder_out: bool = True, orario_out: str = "17:00") -> bool:
+    """
+    Aggiunge l'utente al foglio Notifiche se non esiste.
+    Se già esiste non sovrascrive i suoi settings.
+    """
     try:
         sheet = get_sheet("Notifiche")
         rows = sheet.get_all_values()
-
         for row in rows[1:]:
             if row and row[0].strip() == str(user_id):
-                return True
-
+                return True  # già presente, non toccare
         sheet.append_row([
             str(user_id), nome,
             "TRUE" if reminder_in else "FALSE", orario_in,
             "TRUE" if reminder_out else "FALSE", orario_out,
         ])
-        _invalidate_notifiche_cache()
         return True
     except Exception as e:
         logger.exception("Errore upsert_user_notifiche: %s", e)
@@ -409,12 +427,14 @@ def upsert_user_notifiche(
 
 
 def toggle_notifica(user_id: int, tipo: str) -> Optional[bool]:
-    col = 3 if tipo == "in" else 5
-
+    """
+    Inverte il valore di Reminder Ingresso (tipo='in') o Uscita (tipo='out').
+    Ritorna il nuovo valore (True/False) o None se errore.
+    """
+    col = 3 if tipo == "in" else 5  # col C o E (1-indexed)
     try:
         sheet = get_sheet("Notifiche")
         rows = sheet.get_all_values()
-
         for i, row in enumerate(rows[1:], start=2):
             if row and row[0].strip() == str(user_id):
                 current = row[col - 1].strip().upper() == "TRUE"
@@ -422,7 +442,6 @@ def toggle_notifica(user_id: int, tipo: str) -> Optional[bool]:
                 sheet.update_cell(i, col, "TRUE" if new_val else "FALSE")
                 _invalidate_notifiche_cache()
                 return new_val
-
         return None
     except Exception as e:
         logger.exception("Errore toggle_notifica: %s", e)
@@ -430,18 +449,18 @@ def toggle_notifica(user_id: int, tipo: str) -> Optional[bool]:
 
 
 def set_orario_notifica(user_id: int, tipo: str, orario: str) -> bool:
+    """
+    Aggiorna Orario Ingresso (tipo='in', col D) o Uscita (tipo='out', col F).
+    """
     col = 4 if tipo == "in" else 6
-
     try:
         sheet = get_sheet("Notifiche")
         rows = sheet.get_all_values()
-
         for i, row in enumerate(rows[1:], start=2):
             if row and row[0].strip() == str(user_id):
                 sheet.update_cell(i, col, orario)
                 _invalidate_notifiche_cache()
                 return True
-
         return False
     except Exception as e:
         logger.exception("Errore set_orario_notifica: %s", e)
@@ -494,34 +513,25 @@ class RegistroForm(StatesGroup):
     waiting_ingresso_location = State()
     waiting_uscita_location = State()
 
-
 class PermessiForm(StatesGroup):
     waiting_for_start = State()
     waiting_for_end = State()
     waiting_for_reason = State()
 
-
 class AddZoneForm(StatesGroup):
     waiting_for_location = State()
     waiting_for_name = State()
 
-
 class ZoneManagementForm(StatesGroup):
     waiting_for_new_name = State()
-
-
-class NotificheForm(StatesGroup):
-    waiting_for_orario = State()
 
 
 # ============================================================
 # Calendar builder
 # ============================================================
 def mese_nome(month: int) -> str:
-    mesi = [
-        "Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
-        "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre",
-    ]
+    mesi = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
+            "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"]
     return mesi[month - 1]
 
 
@@ -543,7 +553,11 @@ def build_calendar(year: int, month: int, phase: str):
             if day == 0:
                 kb.button(text=" ", callback_data="ignore")
             else:
-                text_day = f"🔵{day}" if (day == today.day and month == today.month and year == today.year) else str(day)
+                text_day = (
+                    f"🔵{day}"
+                    if (day == today.day and month == today.month and year == today.year)
+                    else str(day)
+                )
                 kb.button(text=text_day, callback_data=f"perm:{phase}:day:{year}:{month}:{day}")
 
     kb.button(text="◀️", callback_data=f"perm:{phase}:nav:{year}:{month}:prev")
@@ -553,9 +567,13 @@ def build_calendar(year: int, month: int, phase: str):
 
 
 # ============================================================
-# Zone UI helpers
+# FIX #7 – Helper DRY per la lista zone (evita duplicazione)
 # ============================================================
 def _build_zones_markup(work_locations: Dict[str, Tuple[float, float]]):
+    """
+    Costruisce l'InlineKeyboard per la lista zone.
+    Era copiato identico in listzones_handler e zone_back_handler.
+    """
     kb = InlineKeyboardBuilder()
     for zone_name in work_locations.keys():
         kb.button(text=f"📍 {zone_name}", callback_data=f"zone_select:{zone_name}")
@@ -565,6 +583,10 @@ def _build_zones_markup(work_locations: Dict[str, Tuple[float, float]]):
 
 
 async def _show_zones_list(target) -> None:
+    """
+    Mostra la lista zone. `target` può essere un Message o un CallbackQuery.
+    Centralizza la logica che era duplicata in listzones_handler e zone_back_handler.
+    """
     work_locations = await asyncio.to_thread(get_work_locations)
     text_vuoto = "❌ Nessuna zona trovata.\n\nAggiungi la tua prima zona di lavoro:"
     text_pieno = "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla, oppure aggiungi una nuova zona:"
@@ -588,7 +610,7 @@ async def _show_zones_list(target) -> None:
 
 
 # ============================================================
-# Handlers base
+# Handlers – Ingresso / Uscita
 # ============================================================
 @dp.message(F.text == "/start")
 async def start_handler(message: Message):
@@ -605,13 +627,11 @@ async def ingresso_start(message: Message, state: FSMContext):
 async def ingresso_location(message: Message, state: FSMContext):
     await state.clear()
     loc = message.location
-
+    # check_location può chiamare Sheets (get_work_locations): va in thread
     location_name = await asyncio.to_thread(check_location, loc.latitude, loc.longitude)
-
     if not location_name:
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
         return
-
     now_local = datetime.now(TIMEZONE).strftime("%H:%M")
     if await async_save_ingresso(message.from_user, now_local, location_name):
         await message.answer("✅ Ingresso registrato!", reply_markup=main_kb)
@@ -629,13 +649,11 @@ async def uscita_start(message: Message, state: FSMContext):
 async def uscita_location(message: Message, state: FSMContext):
     await state.clear()
     loc = message.location
-
+    # check_location può chiamare Sheets (get_work_locations): va in thread
     location_name = await asyncio.to_thread(check_location, loc.latitude, loc.longitude)
-
     if not location_name:
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
         return
-
     now_local = datetime.now(TIMEZONE).strftime("%H:%M")
     if await async_save_uscita(message.from_user, now_local, location_name):
         await message.answer("✅ Uscita registrata!", reply_markup=main_kb)
@@ -644,7 +662,7 @@ async def uscita_location(message: Message, state: FSMContext):
 
 
 # ============================================================
-# Permessi
+# Handlers – Permessi
 # ============================================================
 @dp.message(F.text == "📝 Richiesta permessi")
 async def permessi_start(message: Message, state: FSMContext):
@@ -659,7 +677,6 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
     if len(parts) < 3:
         await cb.answer()
         return
-
     phase, kind = parts[1], parts[2]
 
     if kind == "nav":
@@ -675,7 +692,6 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
     if kind == "day":
         year, month, day = int(parts[3]), int(parts[4]), int(parts[5])
         selected = f"{year}-{month:02d}-{day:02d}"
-
         if phase == "start":
             await state.update_data(start_date=selected)
             await state.set_state(PermessiForm.waiting_for_end)
@@ -686,6 +702,7 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
         elif phase == "end":
             data = await state.get_data()
             start_date = data.get("start_date", "")
+            # Validazione anticipata: fine non può precedere l'inizio
             if selected < start_date:
                 await cb.answer("⚠️ La data di fine non può essere precedente all'inizio!", show_alert=True)
                 return
@@ -694,7 +711,6 @@ async def perm_calendar_handler(cb: CallbackQuery, state: FSMContext):
             await cb.message.edit_text(
                 f"📅 Fine selezionata: <b>{selected}</b>\nOra scrivi il motivo del permesso:"
             )
-
         await cb.answer()
 
 
@@ -705,7 +721,7 @@ async def permessi_reason(message: Message, state: FSMContext):
     end_date = data.get("end_date", "")
     reason = message.text or ""
     await state.clear()
-
+    # FIX #1 – chiamata async
     if await async_save_permesso(message.from_user, start_date, end_date, reason):
         await message.answer("✅ Permesso registrato!", reply_markup=main_kb)
     else:
@@ -713,9 +729,14 @@ async def permessi_reason(message: Message, state: FSMContext):
 
 
 # ============================================================
-# Riepilogo
+# Handlers – Riepilogo (selezione anno → mese → CSV)
 # ============================================================
+
 def _build_year_keyboard() -> types.InlineKeyboardMarkup:
+    """
+    Mostra gli ultimi 3 anni come bottoni inline.
+    L'anno corrente è evidenziato con 🔵.
+    """
     kb = InlineKeyboardBuilder()
     current_year = datetime.now(TIMEZONE).year
     for y in range(current_year, current_year - 3, -1):
@@ -726,15 +747,20 @@ def _build_year_keyboard() -> types.InlineKeyboardMarkup:
 
 
 def _build_month_keyboard(year: int) -> types.InlineKeyboardMarkup:
+    """
+    Mostra i 12 mesi in una griglia 3×4.
+    Il mese corrente (se l'anno è quello corrente) è evidenziato con 🔵.
+    """
     kb = InlineKeyboardBuilder()
-    nomi_mesi = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"]
+    nomi_mesi = [
+        "Gen", "Feb", "Mar", "Apr", "Mag", "Giu",
+        "Lug", "Ago", "Set", "Ott", "Nov", "Dic",
+    ]
     now = datetime.now(TIMEZONE)
-
     for i, nome in enumerate(nomi_mesi, start=1):
-        is_current = year == now.year and i == now.month
+        is_current = (year == now.year and i == now.month)
         label = f"🔵 {nome}" if is_current else nome
         kb.button(text=label, callback_data=f"riepilogo:month:{year}:{i}")
-
     kb.button(text="🔙 Cambia anno", callback_data="riepilogo:back_year")
     kb.adjust(3, 3, 3, 3, 1)
     return kb.as_markup()
@@ -742,6 +768,7 @@ def _build_month_keyboard(year: int) -> types.InlineKeyboardMarkup:
 
 @dp.message(F.text == "📄 Riepilogo")
 async def riepilogo_handler(message: Message):
+    """Passo 1: mostra la selezione dell'anno."""
     await message.answer(
         "📅 <b>Seleziona l'anno</b> per cui vuoi vedere il riepilogo presenze:",
         reply_markup=_build_year_keyboard(),
@@ -750,6 +777,7 @@ async def riepilogo_handler(message: Message):
 
 @dp.callback_query(F.data == "riepilogo:back_year")
 async def riepilogo_back_year(cb: CallbackQuery):
+    """Torna alla selezione dell'anno."""
     await cb.message.edit_text(
         "📅 <b>Seleziona l'anno</b> per cui vuoi vedere il riepilogo presenze:",
         reply_markup=_build_year_keyboard(),
@@ -759,6 +787,7 @@ async def riepilogo_back_year(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("riepilogo:year:"))
 async def riepilogo_year_handler(cb: CallbackQuery):
+    """Passo 2: ricevuto l'anno, mostra la selezione del mese."""
     year = int(cb.data.split(":")[2])
     await cb.message.edit_text(
         f"📅 Anno selezionato: <b>{year}</b>\n\nOra seleziona il <b>mese</b>:",
@@ -769,11 +798,13 @@ async def riepilogo_year_handler(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("riepilogo:month:"))
 async def riepilogo_month_handler(cb: CallbackQuery):
+    """Passo 3: ricevuto il mese, recupera i dati e invia il CSV."""
     parts = cb.data.split(":")
     year, month = int(parts[2]), int(parts[3])
     nome_mese = mese_nome(month)
 
     await cb.answer(f"⏳ Carico {nome_mese} {year}…")
+
     riepilogo = await get_riepilogo(cb.from_user, year, month)
 
     if not riepilogo:
@@ -788,7 +819,9 @@ async def riepilogo_month_handler(cb: CallbackQuery):
     input_file = BufferedInputFile(csv_bytes, filename=filename)
 
     try:
-        await cb.message.edit_text(f"✅ Riepilogo <b>{nome_mese} {year}</b> pronto, lo invio…")
+        await cb.message.edit_text(
+            f"✅ Riepilogo <b>{nome_mese} {year}</b> pronto, lo invio…"
+        )
         await bot.send_document(
             chat_id=cb.message.chat.id,
             document=input_file,
@@ -803,57 +836,65 @@ async def riepilogo_month_handler(cb: CallbackQuery):
 
 
 # ============================================================
-# Istruzioni
+# Handlers – Istruzioni
 # ============================================================
 @dp.message(F.text == "📘 Istruzioni Bot")
 async def istruzioni_handler(message: Message):
     istruzioni_text = (
         "<b>📖 Guida al Bot Presenze</b>\n\n"
- 
+
         "<b>▶️ Avvio</b>\n"
         "Invia /start per aprire il menu principale con questi tasti:\n"
         "🕓 Ingresso  🚪 Uscita  📝 Permessi  📄 Riepilogo\n\n"
- 
+
         "<b>🕓 Registrazione ingresso</b>\n"
         "1. Premi <b>Ingresso</b>\n"
         "2. Tocca il bottone 📍 <b>Invia posizione</b>\n"
         "3. Il bot verifica che tu sia in una sede autorizzata e salva ora e luogo.\n"
         "⚠️ Puoi registrare un solo ingresso al giorno.\n\n"
- 
+
         "<b>🚪 Registrazione uscita</b>\n"
         "1. Premi <b>Uscita</b> e invia la posizione come sopra.\n"
         "2. Il bot aggiorna il tuo registro con l'orario di uscita.\n"
         "⚠️ È necessario aver già registrato l'ingresso nella stessa giornata.\n\n"
- 
+
         "<b>📝 Richiesta permessi</b>\n"
         "1. Premi <b>Richiesta permessi</b>\n"
         "2. Seleziona la <b>data di inizio</b> dal calendario (🔵 = oggi)\n"
         "3. Seleziona la <b>data di fine</b>\n"
         "4. Scrivi il <b>motivo</b> (es. ferie, malattia, permesso)\n"
         "La richiesta viene salvata nel foglio Permessi su Google Sheets.\n\n"
- 
+
         "<b>📄 Riepilogo presenze</b>\n"
         "1. Premi <b>Riepilogo</b>\n"
         "2. Scegli l'<b>anno</b>\n"
         "3. Scegli il <b>mese</b>\n"
         "Riceverai un file CSV con tutti i tuoi ingressi e uscite di quel mese.\n\n"
- 
+
+        "<b>🔔 Notifiche reminder</b>\n"
+        "Il bot ti invia automaticamente un promemoria se dimentichi di timbrare.\n"
+        "• Il reminder di ingresso viene mandato all'orario da te configurato\n"
+        "• Il reminder di uscita viene mandato al tuo orario di uscita\n"
+        "• I reminder <b>non vengono inviati sabato e domenica</b>\n"
+        "• Puoi attivare/disattivare e cambiare l'orario con /mienotifiche\n"
+        "• Vieni aggiunto automaticamente al primo ingresso registrato\n\n"
+
         "<b>⚙️ Comando /mienotifiche</b>\n"
         "Gestisci le tue notifiche personali:\n"
         "• Attiva o disattiva il reminder di ingresso\n"
         "• Attiva o disattiva il reminder di uscita\n"
         "• Imposta l'orario desiderato per ciascuno (formato HH:MM)\n\n"
- 
+
         "<b>📍 Geolocalizzazione e privacy</b>\n"
         "Il bot <b>NON traccia mai</b> la posizione in automatico.\n"
         "La posizione viene usata solo quando la invii tu manualmente.\n"
         "Dati registrati: data/ora · nome e ID Telegram · sede riconosciuta.\n"
         "Nessun tracciamento in background, nessuna condivisione con terzi.\n\n"
- 
+
         "<b>🛡️ GDPR (UE 2016/679)</b>\n"
         "Trasparenza · Minimizzazione · Limitazione temporale · Sicurezza\n"
         "I dati sono accessibili solo ai responsabili autorizzati.\n\n"
- 
+
         "<b>📧 Assistenza</b>\n"
         "sserviceitalia@gmail.com – Shust Dmytro (3298333622)"
     )
@@ -861,7 +902,7 @@ async def istruzioni_handler(message: Message):
 
 
 # ============================================================
-# Gestione Zone admin
+# Handlers – Gestione Zone (admin)
 # ============================================================
 @dp.message(F.text == "/addzone")
 async def addzone_start(message: Message, state: FSMContext):
@@ -874,6 +915,7 @@ async def addzone_start(message: Message, state: FSMContext):
 
 @dp.message(AddZoneForm.waiting_for_location, F.location)
 async def addzone_location(message: Message, state: FSMContext):
+    # FIX #6 – rimosso il re-invio del location_kb (non serve più dopo aver ricevuto la posizione)
     await state.update_data(lat=message.location.latitude, lon=message.location.longitude)
     await state.set_state(AddZoneForm.waiting_for_name)
     await message.answer(
@@ -884,20 +926,18 @@ async def addzone_location(message: Message, state: FSMContext):
 
 @dp.message(AddZoneForm.waiting_for_name)
 async def addzone_name(message: Message, state: FSMContext):
-    if (message.text or "").strip().lower() == "annulla":
+    if message.text.strip().lower() == "annulla":
         await state.clear()
         await message.answer("❌ Operazione annullata.", reply_markup=main_kb)
         return
-
     data = await state.get_data()
     lat, lon = data.get("lat"), data.get("lon")
-    name = (message.text or "").strip()
-
+    name = message.text.strip()
     if lat is None or lon is None or not name:
         await message.answer("❌ Dati mancanti. Riprova con /addzone.", reply_markup=main_kb)
         await state.clear()
         return
-
+    # FIX #1 – chiamata async
     if await asyncio.to_thread(save_new_zone, name, lat, lon):
         kb = InlineKeyboardBuilder()
         kb.button(text="📋 Vedi tutte le zone", callback_data="zone_back")
@@ -908,7 +948,6 @@ async def addzone_name(message: Message, state: FSMContext):
         )
     else:
         await message.answer("❌ Errore durante il salvataggio della zona.", reply_markup=main_kb)
-
     await state.clear()
 
 
@@ -918,7 +957,7 @@ async def listzones_handler(message: Message):
         await message.answer("❌ Non hai i permessi per visualizzare le zone.")
         return
     try:
-        await _show_zones_list(message)
+        await _show_zones_list(message)  # FIX #7 – usa helper DRY
     except Exception as e:
         logger.exception("Errore listzones: %s", e)
         await message.answer("❌ Errore nel caricamento delle zone.", reply_markup=main_kb)
@@ -950,7 +989,7 @@ async def zone_add_new_handler(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "zone_back")
 async def zone_back_handler(cb: CallbackQuery):
     try:
-        await _show_zones_list(cb)
+        await _show_zones_list(cb)  # FIX #7 – usa helper DRY
     except Exception as e:
         logger.exception("Errore zone_back: %s", e)
         await cb.message.edit_text("❌ Errore nel caricamento delle zone.")
@@ -976,7 +1015,7 @@ async def zone_delete_handler(cb: CallbackQuery):
     kb.button(text="❌ Annulla", callback_data=f"zone_select:{zone_name}")
     kb.adjust(1)
     await cb.message.edit_text(
-        f"🗑️ <b>Conferma rimozione</b>\n\nSei sicuro di voler rimuovere <b>{zone_name}</b>?",
+        f"🗑️ <b>Conferma rimozione</b>\n\nSei sicuro di voler rimuovere <b>{zone_name}</b>?\nQuesta azione non può essere annullata.",
         reply_markup=kb.as_markup(),
     )
     await cb.answer()
@@ -985,6 +1024,7 @@ async def zone_delete_handler(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("zone_confirm_delete:"))
 async def zone_confirm_delete_handler(cb: CallbackQuery):
     zone_name = cb.data.split(":", 1)[1]
+    # FIX #1 – chiamata async
     if await asyncio.to_thread(delete_zone, zone_name):
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Torna alla lista", callback_data="zone_back")
@@ -1000,20 +1040,18 @@ async def zone_confirm_delete_handler(cb: CallbackQuery):
 
 @dp.message(ZoneManagementForm.waiting_for_new_name)
 async def zone_new_name_handler(message: Message, state: FSMContext):
-    if (message.text or "").strip().lower() == "annulla":
+    if message.text.strip().lower() == "annulla":
         await state.clear()
         await message.answer("❌ Operazione annullata.", reply_markup=main_kb)
         return
-
     data = await state.get_data()
     old_name = data.get("editing_zone")
-    new_name = (message.text or "").strip()
-
+    new_name = message.text.strip()
     if not old_name or not new_name:
         await message.answer("❌ Dati mancanti. Riprova con /listzones.", reply_markup=main_kb)
         await state.clear()
         return
-
+    # FIX #1 – chiamata async
     if await asyncio.to_thread(update_zone_name, old_name, new_name):
         await message.answer(
             f"✅ Zona rinominata!\n<b>Prima:</b> {old_name}\n<b>Dopo:</b> {new_name}",
@@ -1021,12 +1059,11 @@ async def zone_new_name_handler(message: Message, state: FSMContext):
         )
     else:
         await message.answer(f"❌ Errore nella modifica della zona <b>{old_name}</b>.", reply_markup=main_kb)
-
     await state.clear()
 
 
 # ============================================================
-# Scheduler / Reminders
+# Scheduler / Reminders – per-utente con settings da Sheets
 # ============================================================
 async def send_reminder(user_id: int, text: str) -> None:
     try:
@@ -1036,54 +1073,66 @@ async def send_reminder(user_id: int, text: str) -> None:
         logger.error("Errore invio reminder a %s: %s", user_id, e)
 
 
+# Cache interna settings notifiche per lo scheduler (aggiornata ogni 5 min)
 _notifiche_cache: Dict[int, dict] = {}
 _notifiche_cache_time: Optional[datetime] = None
-_NOTIFICHE_TTL = 300
+_NOTIFICHE_TTL = 300  # 5 minuti
 
 
 def _invalidate_notifiche_cache() -> None:
+    """Invalida la cache notifiche dopo ogni modifica (toggle o cambio orario)."""
     global _notifiche_cache, _notifiche_cache_time
     _notifiche_cache = {}
     _notifiche_cache_time = None
 
 
 async def _get_notifiche_cached() -> Dict[int, dict]:
+    """
+    Restituisce le impostazioni notifiche con cache 5 minuti.
+    Evita di leggere il foglio Notifiche ad ogni tick dello scheduler (ogni 30s).
+    Prima lo scheduler leggeva Sheets ~2880 volte/giorno; ora al massimo 288 volte.
+    """
     global _notifiche_cache, _notifiche_cache_time
-
     now = datetime.now(TIMEZONE)
     if (
         _notifiche_cache_time is not None
         and (now - _notifiche_cache_time).total_seconds() < _NOTIFICHE_TTL
     ):
         return _notifiche_cache
-
     _notifiche_cache = await asyncio.to_thread(get_notifiche_settings)
     _notifiche_cache_time = now
     return _notifiche_cache
 
 
 async def scheduler_loop() -> None:
-    logger.info("Scheduler loop avviato")
-
+    """
+    Scheduler per-utente ottimizzato:
+    - Ogni 30s controlla se l'ora attuale coincide con un orario reminder.
+    - Carica le impostazioni notifiche dal cache (aggiornato ogni 5 min).
+    - Carica il Registro da Sheets SOLO se almeno un utente ha un reminder
+      attivo in quest'ora, evitando chiamate API inutili.
+    - Non invia il reminder se l'utente ha già timbrato oggi.
+    - Salta sabato e domenica.
+    """
+    logger.info("Scheduler loop avviato (controllo ogni 30s, per-utente, ottimizzato)")
     try:
         while True:
             try:
                 now = datetime.now(TIMEZONE)
-
-                if now.weekday() < 5:
+                if now.weekday() < 5:  # lunedì-venerdì
                     hhmm = now.strftime("%H:%M")
                     today = now.strftime("%d.%m.%Y")
                     today_date = now.date()
 
                     settings = await _get_notifiche_cached()
 
+                    # Controlla se c'è almeno un reminder attivo per quest'ora
                     needs_ingresso = [
                         (uid, cfg) for uid, cfg in settings.items()
                         if cfg["reminder_ingresso"]
                         and cfg["orario_ingresso"] == hhmm
                         and _sent_ingresso_today.get(uid) != today_date
                     ]
-
                     needs_uscita = [
                         (uid, cfg) for uid, cfg in settings.items()
                         if cfg["reminder_uscita"]
@@ -1091,10 +1140,10 @@ async def scheduler_loop() -> None:
                         and _sent_uscita_today.get(uid) != today_date
                     ]
 
+                    # Legge il Registro solo se serve davvero
                     if needs_ingresso or needs_uscita:
                         sheet_reg = await asyncio.to_thread(get_sheet, "Registro")
                         reg_rows = await asyncio.to_thread(sheet_reg.get_all_values)
-
                         entered_today = {
                             row[1] for row in reg_rows[1:]
                             if len(row) > 2 and row[0] == today and row[2]
@@ -1107,14 +1156,20 @@ async def scheduler_loop() -> None:
                         for uid, cfg in needs_ingresso:
                             has_entered = any(s.endswith(f"| {uid}") for s in entered_today)
                             if not has_entered:
-                                await send_reminder(uid, f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'ingresso!")
+                                await send_reminder(
+                                    uid,
+                                    f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'ingresso!"
+                                )
                             _sent_ingresso_today[uid] = today_date
 
                         for uid, cfg in needs_uscita:
                             has_entered = any(s.endswith(f"| {uid}") for s in entered_today)
                             has_exited = any(s.endswith(f"| {uid}") for s in exited_today)
                             if has_entered and not has_exited:
-                                await send_reminder(uid, f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'uscita!")
+                                await send_reminder(
+                                    uid,
+                                    f"🔔 Ciao {cfg['nome']}, ricorda di registrare l'uscita!"
+                                )
                             _sent_uscita_today[uid] = today_date
 
             except asyncio.CancelledError:
@@ -1128,7 +1183,7 @@ async def scheduler_loop() -> None:
 
 
 # ============================================================
-# Notifiche utente/admin
+# Handlers – /mienotifiche (ogni utente gestisce i propri)
 # ============================================================
 def _build_notif_kb_user(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1138,8 +1193,74 @@ def _build_notif_kb_user(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
     kb.button(text=f"⏰ Orario ingresso: {cfg['orario_ingresso']}  ✏️", callback_data=f"notif:set_orario_in:{uid}")
     kb.button(text=f"🚪 Reminder uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
     kb.button(text=f"⏰ Orario uscita: {cfg['orario_uscita']}  ✏️", callback_data=f"notif:set_orario_out:{uid}")
-    kb.adjust(1)
+    kb.adjust(1)  # un bottone per riga: testo completo visibile su mobile
     return kb.as_markup()
+
+
+@dp.message(F.text.in_({"/mienotifiche", "🔔 Mie Notifiche"}))
+async def mienotifiche_handler(message: Message):
+    uid = message.from_user.id
+    settings = await asyncio.to_thread(get_notifiche_settings)
+    if uid not in settings:
+        await message.answer(
+            "⚠️ Non sei ancora registrato nel sistema notifiche.\n"
+            "Registra almeno un ingresso per essere aggiunto automaticamente."
+        )
+        return
+    cfg = settings[uid]
+    await message.answer(
+        "🔔 <b>Le tue notifiche</b>\n\nTocca un bottone per attivare/disattivare o cambiare l'orario:",
+        reply_markup=_build_notif_kb_user(uid, cfg),
+    )
+
+
+# ============================================================
+# Handlers – /notifiche (admin: vede tutti gli utenti)
+# ============================================================
+@dp.message(F.text == "/notifiche")
+async def notifiche_admin_handler(message: Message):
+    if message.from_user.id not in ADMINS:
+        await message.answer("❌ Non hai i permessi.")
+        return
+    settings = await asyncio.to_thread(get_notifiche_settings)
+    if not settings:
+        await message.answer("❌ Nessun utente nel foglio Notifiche.")
+        return
+    kb = InlineKeyboardBuilder()
+    for uid, cfg in settings.items():
+        stato = "✅" if (cfg["reminder_ingresso"] or cfg["reminder_uscita"]) else "❌"
+        kb.button(
+            text=f"{stato} {cfg['nome']}",
+            callback_data=f"notif:admin_user:{uid}"
+        )
+    kb.adjust(1)
+    await message.answer(
+        "👥 <b>Gestione notifiche utenti</b>\n\nSeleziona un utente:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("notif:admin_user:"))
+async def notif_admin_user_handler(cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:
+        await cb.answer("❌ Non autorizzato.", show_alert=True)
+        return
+    uid = int(cb.data.split(":")[2])
+    settings = await asyncio.to_thread(get_notifiche_settings)
+    if uid not in settings:
+        await cb.answer("Utente non trovato.", show_alert=True)
+        return
+    cfg = settings[uid]
+    nome = cfg['nome']
+    in_stato = '✅ ON' if cfg['reminder_ingresso'] else '❌ OFF'
+    out_stato = '✅ ON' if cfg['reminder_uscita'] else '❌ OFF'
+    testo = (
+        f"👤 <b>{nome}</b>\n\n"
+        f"🕓 Ingresso: {in_stato} — {cfg['orario_ingresso']}\n"
+        f"🚪 Uscita: {out_stato} — {cfg['orario_uscita']}"
+    )
+    await cb.message.edit_text(testo, reply_markup=_build_notif_kb_admin(uid, cfg))
+    await cb.answer()
 
 
 def _build_notif_kb_admin(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
@@ -1151,69 +1272,8 @@ def _build_notif_kb_admin(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
     kb.button(text=f"🚪 Reminder uscita: {stato_out}", callback_data=f"notif:toggle_out:{uid}")
     kb.button(text=f"⏰ Orario uscita: {cfg['orario_uscita']}  ✏️", callback_data=f"notif:set_orario_out:{uid}")
     kb.button(text="🔙 Torna alla lista", callback_data="notif:admin_list")
-    kb.adjust(1)
+    kb.adjust(1)  # un bottone per riga: testo completo visibile su mobile
     return kb.as_markup()
-
-
-@dp.message(F.text.in_({"/mienotifiche", "🔔 Mie Notifiche"}))
-async def mienotifiche_handler(message: Message):
-    uid = message.from_user.id
-    settings = await asyncio.to_thread(get_notifiche_settings)
-
-    if uid not in settings:
-        await message.answer(
-            "⚠️ Non sei ancora registrato nel sistema notifiche.\n"
-            "Registra almeno un ingresso per essere aggiunto automaticamente."
-        )
-        return
-
-    cfg = settings[uid]
-    await message.answer(
-        "🔔 <b>Le tue notifiche</b>\n\nTocca un bottone per attivare/disattivare o cambiare l'orario:",
-        reply_markup=_build_notif_kb_user(uid, cfg),
-    )
-
-
-@dp.message(F.text == "/notifiche")
-async def notifiche_admin_handler(message: Message):
-    if message.from_user.id not in ADMINS:
-        await message.answer("❌ Non hai i permessi.")
-        return
-
-    settings = await asyncio.to_thread(get_notifiche_settings)
-    if not settings:
-        await message.answer("❌ Nessun utente nel foglio Notifiche.")
-        return
-
-    kb = InlineKeyboardBuilder()
-    for uid, cfg in settings.items():
-        stato = "✅" if (cfg["reminder_ingresso"] or cfg["reminder_uscita"]) else "❌"
-        kb.button(text=f"{stato} {cfg['nome']}", callback_data=f"notif:admin_user:{uid}")
-    kb.adjust(1)
-
-    await message.answer("👥 <b>Gestione notifiche utenti</b>\n\nSeleziona un utente:", reply_markup=kb.as_markup())
-
-
-@dp.callback_query(F.data.startswith("notif:admin_user:"))
-async def notif_admin_user_handler(cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS:
-        await cb.answer("❌ Non autorizzato.", show_alert=True)
-        return
-
-    uid = int(cb.data.split(":")[2])
-    settings = await asyncio.to_thread(get_notifiche_settings)
-    if uid not in settings:
-        await cb.answer("Utente non trovato.", show_alert=True)
-        return
-
-    cfg = settings[uid]
-    testo = (
-        f"👤 <b>{cfg['nome']}</b>\n\n"
-        f"🕓 Ingresso: {'✅ ON' if cfg['reminder_ingresso'] else '❌ OFF'} — {cfg['orario_ingresso']}\n"
-        f"🚪 Uscita: {'✅ ON' if cfg['reminder_uscita'] else '❌ OFF'} — {cfg['orario_uscita']}"
-    )
-    await cb.message.edit_text(testo, reply_markup=_build_notif_kb_admin(uid, cfg))
-    await cb.answer()
 
 
 @dp.callback_query(F.data == "notif:admin_list")
@@ -1221,24 +1281,27 @@ async def notif_admin_list_handler(cb: CallbackQuery):
     if cb.from_user.id not in ADMINS:
         await cb.answer("❌ Non autorizzato.", show_alert=True)
         return
-
     settings = await asyncio.to_thread(get_notifiche_settings)
     kb = InlineKeyboardBuilder()
     for uid, cfg in settings.items():
         stato = "✅" if (cfg["reminder_ingresso"] or cfg["reminder_uscita"]) else "❌"
         kb.button(text=f"{stato} {cfg['nome']}", callback_data=f"notif:admin_user:{uid}")
     kb.adjust(1)
-
-    await cb.message.edit_text("👥 <b>Gestione notifiche utenti</b>\n\nSeleziona un utente:", reply_markup=kb.as_markup())
+    await cb.message.edit_text(
+        "👥 <b>Gestione notifiche utenti</b>\n\nSeleziona un utente:",
+        reply_markup=kb.as_markup(),
+    )
     await cb.answer()
 
 
+# Toggle attiva/disattiva reminder (usato sia da utente che da admin)
 @dp.callback_query(F.data.startswith("notif:toggle_in:") | F.data.startswith("notif:toggle_out:"))
 async def notif_toggle_handler(cb: CallbackQuery):
     parts = cb.data.split(":")
     tipo = "in" if parts[1] == "toggle_in" else "out"
     uid = int(parts[2])
 
+    # Solo l'utente stesso o un admin può modificare
     if cb.from_user.id != uid and cb.from_user.id not in ADMINS:
         await cb.answer("❌ Non autorizzato.", show_alert=True)
         return
@@ -1248,22 +1311,28 @@ async def notif_toggle_handler(cb: CallbackQuery):
         await cb.answer("❌ Errore nel salvataggio.", show_alert=True)
         return
 
-    tipo_str = "ingresso" if tipo == "in" else "uscita"
     stato = "✅ attivato" if new_val else "❌ disattivato"
+    tipo_str = "ingresso" if tipo == "in" else "uscita"
     await cb.answer(f"Reminder {tipo_str} {stato}!")
 
+    # Aggiorna la tastiera con i nuovi valori
     settings = await asyncio.to_thread(get_notifiche_settings)
     if uid not in settings:
         return
-
     cfg = settings[uid]
     is_admin_view = cb.from_user.id in ADMINS and cb.from_user.id != uid
     new_kb = _build_notif_kb_admin(uid, cfg) if is_admin_view else _build_notif_kb_user(uid, cfg)
-
     try:
         await cb.message.edit_reply_markup(reply_markup=new_kb)
     except Exception:
         pass
+
+
+# ============================================================
+# FSM – Cambio orario notifica
+# ============================================================
+class NotificheForm(StatesGroup):
+    waiting_for_orario = State()   # attende "HH:MM" dall'utente
 
 
 @dp.callback_query(F.data.startswith("notif:set_orario_in:") | F.data.startswith("notif:set_orario_out:"))
@@ -1278,20 +1347,17 @@ async def notif_set_orario_start(cb: CallbackQuery, state: FSMContext):
 
     await state.update_data(notif_uid=uid, notif_tipo=tipo)
     await state.set_state(NotificheForm.waiting_for_orario)
-
     tipo_str = "ingresso" if tipo == "in" else "uscita"
-    await cb.message.edit_text(
-        f"⏰ Inserisci il nuovo orario per il reminder di <b>{tipo_str}</b>\n\n"
-        f"Formato: <code>HH:MM</code> — es. <code>08:30</code>"
-    )
+    msg = f"⏰ Inserisci il nuovo orario per il reminder di <b>{tipo_str}</b>\n\nFormato: <code>HH:MM</code> — es. <code>08:30</code>"
+    await cb.message.edit_text(msg)
     await cb.answer()
 
 
 @dp.message(NotificheForm.waiting_for_orario)
 async def notif_set_orario_receive(message: Message, state: FSMContext):
-    import re
-
     testo = (message.text or "").strip()
+    # Validazione formato HH:MM
+    import re
     if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", testo):
         await message.answer("❌ Formato non valido. Scrivi l'orario come <code>HH:MM</code>, es. <code>08:30</code>")
         return
@@ -1303,23 +1369,25 @@ async def notif_set_orario_receive(message: Message, state: FSMContext):
 
     ok = await asyncio.to_thread(set_orario_notifica, uid, tipo, testo)
     tipo_str = "ingresso" if tipo == "in" else "uscita"
-
     if ok:
-        await message.answer(f"✅ Orario reminder <b>{tipo_str}</b> aggiornato a <b>{testo}</b>!", reply_markup=main_kb)
+        await message.answer(
+            f"✅ Orario reminder <b>{tipo_str}</b> aggiornato a <b>{testo}</b>!",
+            reply_markup=main_kb,
+        )
     else:
         await message.answer("❌ Errore nel salvataggio. L'utente potrebbe non essere nel foglio Notifiche.", reply_markup=main_kb)
 
 
+# /remindtest solo admin – forza invio immediato per test
 @dp.message(F.text == "/remindtest")
 async def remindtest_handler(message: Message):
     if message.from_user.id not in ADMINS:
         await message.answer("❌ Non hai i permessi per eseguire questo comando.")
         return
-
-    await message.answer("⏳ Eseguo test scheduler…")
+    await message.answer("⏳ Eseguo test scheduler (simulo un check immediato)…")
+    # Forza l'ora corrente come se fosse l'orario configurato per ogni utente
     settings = await asyncio.to_thread(get_notifiche_settings)
     count = 0
-
     for uid, cfg in settings.items():
         if cfg["reminder_ingresso"]:
             await send_reminder(uid, f"🔔 [TEST] Ciao {cfg['nome']}, reminder ingresso di prova!")
@@ -1327,24 +1395,29 @@ async def remindtest_handler(message: Message):
         if cfg["reminder_uscita"]:
             await send_reminder(uid, f"🔔 [TEST] Ciao {cfg['nome']}, reminder uscita di prova!")
             count += 1
-
     await message.answer(f"✅ Inviati {count} reminder di test.")
 
 
 # ============================================================
-# Status admin
+# Comando /status (solo admin) – diagnostica dal bot
 # ============================================================
 @dp.message(F.text == "/status")
 async def status_handler(message: Message):
+    """
+    Comando di diagnostica: riepiloga lo stato di tutte le componenti.
+    Utile per capire cosa non funziona senza dover leggere i log di Render.
+    Solo gli admin possono usarlo.
+    """
     if message.from_user.id not in ADMINS:
         await message.answer("❌ Non hai i permessi.")
         return
 
     lines = ["<b>🔍 Diagnostica Bot</b>\n"]
-    lines.append(f"🔑 <b>Token:</b> {'✅ presente' if TOKEN else '❌ MANCANTE'}")
-    lines.append(f"⚙️ <b>WEBHOOK_URL env:</b> {'✅ ' + WEBHOOK_URL if WEBHOOK_URL else '❌ MANCANTE'}")
-    lines.append(f"🗂 <b>Sheet ID:</b> {'✅ presente' if SHEET_ID else '❌ MANCANTE'}")
 
+    # 1. Token
+    lines.append(f"🔑 <b>Token:</b> {'✅ presente' if TOKEN else '❌ MANCANTE'}")
+
+    # 2. Webhook registrato su Telegram
     try:
         wh = await bot.get_webhook_info()
         if wh.url:
@@ -1353,22 +1426,31 @@ async def status_handler(message: Message):
             if wh.last_error_message:
                 lines.append(f"   ⚠️ Ultimo errore Telegram: {wh.last_error_message}")
         else:
-            lines.append("🌐 <b>Webhook URL:</b> ❌ NON impostato su Telegram")
+            lines.append("🌐 <b>Webhook URL:</b> ❌ NON impostato su Telegram!\n"
+                         "   → Imposta WEBHOOK_URL nelle env vars di Render.")
     except Exception as e:
         lines.append(f"🌐 <b>Webhook:</b> ❌ errore lettura ({e})")
 
+    # 3. Variabile WEBHOOK_URL locale
+    lines.append(f"⚙️ <b>WEBHOOK_URL env:</b> {'✅ ' + WEBHOOK_URL if WEBHOOK_URL else '❌ MANCANTE'}")
+
+    # 4. Google Sheets
     try:
         await asyncio.to_thread(get_sheet, "Registro")
         lines.append("📊 <b>Google Sheets:</b> ✅ connesso")
     except Exception as e:
         lines.append(f"📊 <b>Google Sheets:</b> ❌ errore: {e}")
 
+    # 5. Credenziali Google
     if CREDENTIALS_JSON:
         lines.append("🔐 <b>Google Credentials:</b> ✅ da variabile JSON")
     elif CREDENTIALS_FILE:
         lines.append(f"🔐 <b>Google Credentials:</b> ✅ da file ({CREDENTIALS_FILE})")
     else:
-        lines.append("🔐 <b>Google Credentials:</b> ❌ MANCANTI")
+        lines.append("🔐 <b>Google Credentials:</b> ❌ MANCANTI (né JSON né FILE)")
+
+    # 6. Sheet ID
+    lines.append(f"🗂 <b>Sheet ID:</b> {'✅ presente' if SHEET_ID else '❌ MANCANTE'}")
 
     await message.answer("\n".join(lines))
 
@@ -1376,14 +1458,10 @@ async def status_handler(message: Message):
 # ============================================================
 # FastAPI + lifecycle
 # ============================================================
-scheduler_task: Optional[asyncio.Task] = None
-
-
 async def on_startup() -> None:
-    global scheduler_task
-
     await asyncio.to_thread(init_sheets)
 
+    # Registra il webhook su Telegram
     if WEBHOOK_URL:
         webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
         try:
@@ -1392,39 +1470,32 @@ async def on_startup() -> None:
         except Exception as e:
             logger.error("Errore impostazione webhook: %s", e)
     else:
-        logger.warning("WEBHOOK_URL non impostato: il webhook NON è stato registrato su Telegram.")
+        logger.warning(
+            "WEBHOOK_URL non impostato: il webhook NON è stato registrato su Telegram.\n"
+            "Imposta la variabile WEBHOOK_URL = https://<tuo-app>.onrender.com nelle env vars di Render."
+        )
 
-    scheduler_task = asyncio.create_task(scheduler_loop())
+    asyncio.create_task(scheduler_loop())
     logger.info("Startup completato.")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global scheduler_task
-
     await on_startup()
-    try:
-        yield
-    finally:
-        if scheduler_task:
-            scheduler_task.cancel()
-            try:
-                await scheduler_task
-            except asyncio.CancelledError:
-                pass
-        await bot.delete_webhook()
-        await bot.session.close()
-        logger.info("Shutdown completato.")
+    yield
+    await bot.delete_webhook()
+    logger.info("Shutdown completato.")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-async def process_update(update: types.Update) -> None:
+async def _process_update(update: types.Update) -> None:
     """
-    Processa l'update fuori dalla richiesta HTTP.
-    Così Telegram riceve subito 200 OK e non ritenta lo stesso update
-    se Google Sheets è lento o un handler impiega troppo.
+    Processa l'update in un task separato.
+    Il webhook ritorna subito {"ok": True} a Telegram senza aspettare
+    che Google Sheets risponda — elimina il blocco dell'event loop
+    che causava i riavvii e i retry di Telegram.
     """
     try:
         await dp.feed_update(bot=bot, update=update)
@@ -1434,13 +1505,12 @@ async def process_update(update: types.Update) -> None:
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """
-    Webhook non bloccante.
-    Non restituisce 500 a Telegram per errori interni, per evitare retry continui.
-    """
     try:
         update = types.Update.model_validate(await request.json(), context={"bot": bot})
-        asyncio.create_task(process_update(update))
+        asyncio.create_task(_process_update(update))
+        # Risponde subito a Telegram: non aspetta Google Sheets.
+        # NON restituire 500 su errori interni: Telegram reinvierebbe
+        # lo stesso update peggiorando il blocco.
         return {"ok": True}
     except Exception as e:
         logger.exception("Errore parsing webhook: %s", e)
@@ -1449,18 +1519,27 @@ async def webhook(request: Request):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
+    # methods=["GET","HEAD"] gestisce entrambi i metodi con un solo handler.
+    # Render usa HEAD / come health check: senza questa riga risponde 405
+    # e Render riavvia il servizio ogni pochi minuti.
     return {"status": "running", "webhook_url": WEBHOOK_URL or "NON IMPOSTATO"}
 
 
 @app.get("/debug")
 async def debug_endpoint():
+    """
+    Endpoint pubblico di diagnostica rapida.
+    Apri https://<tuo-app>.onrender.com/debug nel browser per vedere lo stato.
+    """
     result = {
         "bot_token_set": bool(TOKEN),
         "webhook_url_env": WEBHOOK_URL or "MANCANTE",
         "sheet_id_set": bool(SHEET_ID),
-        "credentials_source": "json_env" if CREDENTIALS_JSON else ("file" if CREDENTIALS_FILE else "MANCANTE"),
+        "credentials_source": (
+            "json_env" if CREDENTIALS_JSON
+            else ("file" if CREDENTIALS_FILE else "MANCANTE")
+        ),
     }
-
     try:
         wh = await bot.get_webhook_info()
         result["telegram_webhook_url"] = wh.url or "NON IMPOSTATO"
@@ -1483,6 +1562,5 @@ async def debug_endpoint():
 # ============================================================
 if __name__ == "__main__":
     import uvicorn
-
     logger.info("Avvio uvicorn FastAPI + webhook")
     uvicorn.run("bot:app", host="0.0.0.0", port=PORT, log_level="info")
