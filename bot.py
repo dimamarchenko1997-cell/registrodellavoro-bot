@@ -53,6 +53,32 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
+# Semaforo: max 3 chiamate a Google Sheets contemporanee.
+# Senza questo il thread pool si esaurisce quando Sheets è lento
+# e il bot smette di rispondere a qualsiasi comando.
+_sheets_semaphore = asyncio.Semaphore(3)
+
+
+async def sheets_call(fn, *args, timeout: float = 15.0):
+    """
+    Esegue una funzione sincrona (chiamata a Sheets) in un thread separato
+    con semaforo (max 3 contemporanee) e timeout (default 15s).
+    Se Sheets non risponde entro il timeout, lancia TimeoutError invece
+    di bloccare il thread per sempre.
+    """
+    async with _sheets_semaphore:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(fn, *args),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error("Timeout chiamata Sheets: %s(%s)", fn.__name__, args)
+            # Reset client gspread: la connessione potrebbe essere corrotta
+            global _gspread_client
+            _gspread_client = None
+            raise
+
 # Traccia i reminder già inviati oggi per ogni utente {user_id: date}
 _sent_ingresso_today: Dict[int, date] = {}
 _sent_uscita_today: Dict[int, date] = {}
@@ -228,7 +254,7 @@ def delete_zone(name: str) -> bool:
 
 
 async def async_save_ingresso(user: types.User, time_str: str, location_name: str) -> bool:
-    return await asyncio.to_thread(_sync_save_ingresso, user, time_str, location_name)
+    return await sheets_call(_sync_save_ingresso, user, time_str, location_name)
 
 def _sync_save_ingresso(user: types.User, time_str: str, location_name: str) -> bool:
     try:
@@ -251,7 +277,7 @@ def _sync_save_ingresso(user: types.User, time_str: str, location_name: str) -> 
 
 
 async def async_save_uscita(user: types.User, time_str: str, location_name: str) -> bool:
-    return await asyncio.to_thread(_sync_save_uscita, user, time_str, location_name)
+    return await sheets_call(_sync_save_uscita, user, time_str, location_name)
 
 def _sync_save_uscita(user: types.User, time_str: str, location_name: str) -> bool:
     try:
@@ -279,7 +305,7 @@ def _sync_save_uscita(user: types.User, time_str: str, location_name: str) -> bo
 
 
 async def async_save_permesso(user: types.User, start_date: str, end_date: str, reason: str) -> bool:
-    return await asyncio.to_thread(_sync_save_permesso, user, start_date, end_date, reason)
+    return await sheets_call(_sync_save_permesso, user, start_date, end_date, reason)
 
 def _sync_save_permesso(user: types.User, start_date: str, end_date: str, reason: str) -> bool:
     try:
@@ -301,7 +327,7 @@ def _sync_save_permesso(user: types.User, start_date: str, end_date: str, reason
 
 async def get_riepilogo(user: types.User, year: int, month: int) -> Optional[io.StringIO]:
     """Restituisce il CSV delle presenze dell'utente filtrato per anno e mese."""
-    return await asyncio.to_thread(_sync_get_riepilogo, user, year, month)
+    return await sheets_call(_sync_get_riepilogo, user, year, month)
 
 def _sync_get_riepilogo(user: types.User, year: int, month: int) -> Optional[io.StringIO]:
     """
@@ -587,7 +613,7 @@ async def _show_zones_list(target) -> None:
     Mostra la lista zone. `target` può essere un Message o un CallbackQuery.
     Centralizza la logica che era duplicata in listzones_handler e zone_back_handler.
     """
-    work_locations = await asyncio.to_thread(get_work_locations)
+    work_locations = await sheets_call(get_work_locations)
     text_vuoto = "❌ Nessuna zona trovata.\n\nAggiungi la tua prima zona di lavoro:"
     text_pieno = "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla, oppure aggiungi una nuova zona:"
 
@@ -627,16 +653,22 @@ async def ingresso_start(message: Message, state: FSMContext):
 async def ingresso_location(message: Message, state: FSMContext):
     await state.clear()
     loc = message.location
-    # check_location può chiamare Sheets (get_work_locations): va in thread
-    location_name = await asyncio.to_thread(check_location, loc.latitude, loc.longitude)
+    try:
+        location_name = await sheets_call(check_location, loc.latitude, loc.longitude)
+    except asyncio.TimeoutError:
+        await message.answer("⚠️ Il server è lento, riprova tra qualche secondo.", reply_markup=main_kb)
+        return
     if not location_name:
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
         return
     now_local = datetime.now(TIMEZONE).strftime("%H:%M")
-    if await async_save_ingresso(message.from_user, now_local, location_name):
-        await message.answer("✅ Ingresso registrato!", reply_markup=main_kb)
-    else:
-        await message.answer("❌ Ingresso già registrato per oggi.", reply_markup=main_kb)
+    try:
+        if await async_save_ingresso(message.from_user, now_local, location_name):
+            await message.answer("✅ Ingresso registrato!", reply_markup=main_kb)
+        else:
+            await message.answer("❌ Ingresso già registrato per oggi.", reply_markup=main_kb)
+    except asyncio.TimeoutError:
+        await message.answer("⚠️ Timeout salvataggio, riprova tra qualche secondo.", reply_markup=main_kb)
 
 
 @dp.message(F.text == "🚪 Uscita")
@@ -649,16 +681,22 @@ async def uscita_start(message: Message, state: FSMContext):
 async def uscita_location(message: Message, state: FSMContext):
     await state.clear()
     loc = message.location
-    # check_location può chiamare Sheets (get_work_locations): va in thread
-    location_name = await asyncio.to_thread(check_location, loc.latitude, loc.longitude)
+    try:
+        location_name = await sheets_call(check_location, loc.latitude, loc.longitude)
+    except asyncio.TimeoutError:
+        await message.answer("⚠️ Il server è lento, riprova tra qualche secondo.", reply_markup=main_kb)
+        return
     if not location_name:
         await message.answer("❌ Non sei in un luogo autorizzato.", reply_markup=main_kb)
         return
     now_local = datetime.now(TIMEZONE).strftime("%H:%M")
-    if await async_save_uscita(message.from_user, now_local, location_name):
-        await message.answer("✅ Uscita registrata!", reply_markup=main_kb)
-    else:
-        await message.answer("❌ Nessun ingresso trovato per oggi.", reply_markup=main_kb)
+    try:
+        if await async_save_uscita(message.from_user, now_local, location_name):
+            await message.answer("✅ Uscita registrata!", reply_markup=main_kb)
+        else:
+            await message.answer("❌ Nessun ingresso trovato per oggi.", reply_markup=main_kb)
+    except asyncio.TimeoutError:
+        await message.answer("⚠️ Timeout salvataggio, riprova tra qualche secondo.", reply_markup=main_kb)
 
 
 # ============================================================
@@ -938,7 +976,7 @@ async def addzone_name(message: Message, state: FSMContext):
         await state.clear()
         return
     # FIX #1 – chiamata async
-    if await asyncio.to_thread(save_new_zone, name, lat, lon):
+    if await sheets_call(save_new_zone, name, lat, lon):
         kb = InlineKeyboardBuilder()
         kb.button(text="📋 Vedi tutte le zone", callback_data="zone_back")
         kb.adjust(1)
@@ -1025,7 +1063,7 @@ async def zone_delete_handler(cb: CallbackQuery):
 async def zone_confirm_delete_handler(cb: CallbackQuery):
     zone_name = cb.data.split(":", 1)[1]
     # FIX #1 – chiamata async
-    if await asyncio.to_thread(delete_zone, zone_name):
+    if await sheets_call(delete_zone, zone_name):
         kb = InlineKeyboardBuilder()
         kb.button(text="🔙 Torna alla lista", callback_data="zone_back")
         kb.adjust(1)
@@ -1052,7 +1090,7 @@ async def zone_new_name_handler(message: Message, state: FSMContext):
         await state.clear()
         return
     # FIX #1 – chiamata async
-    if await asyncio.to_thread(update_zone_name, old_name, new_name):
+    if await sheets_call(update_zone_name, old_name, new_name):
         await message.answer(
             f"✅ Zona rinominata!\n<b>Prima:</b> {old_name}\n<b>Dopo:</b> {new_name}",
             reply_markup=main_kb,
@@ -1099,7 +1137,7 @@ async def _get_notifiche_cached() -> Dict[int, dict]:
         and (now - _notifiche_cache_time).total_seconds() < _NOTIFICHE_TTL
     ):
         return _notifiche_cache
-    _notifiche_cache = await asyncio.to_thread(get_notifiche_settings)
+    _notifiche_cache = await sheets_call(get_notifiche_settings)
     _notifiche_cache_time = now
     return _notifiche_cache
 
@@ -1142,7 +1180,7 @@ async def scheduler_loop() -> None:
 
                     # Legge il Registro solo se serve davvero
                     if needs_ingresso or needs_uscita:
-                        sheet_reg = await asyncio.to_thread(get_sheet, "Registro")
+                        sheet_reg = await sheets_call(get_sheet, "Registro")
                         reg_rows = await asyncio.to_thread(sheet_reg.get_all_values)
                         entered_today = {
                             row[1] for row in reg_rows[1:]
@@ -1200,7 +1238,7 @@ def _build_notif_kb_user(uid: int, cfg: dict) -> types.InlineKeyboardMarkup:
 @dp.message(F.text.in_({"/mienotifiche", "🔔 Mie Notifiche"}))
 async def mienotifiche_handler(message: Message):
     uid = message.from_user.id
-    settings = await asyncio.to_thread(get_notifiche_settings)
+    settings = await sheets_call(get_notifiche_settings)
     if uid not in settings:
         await message.answer(
             "⚠️ Non sei ancora registrato nel sistema notifiche.\n"
@@ -1222,7 +1260,7 @@ async def notifiche_admin_handler(message: Message):
     if message.from_user.id not in ADMINS:
         await message.answer("❌ Non hai i permessi.")
         return
-    settings = await asyncio.to_thread(get_notifiche_settings)
+    settings = await sheets_call(get_notifiche_settings)
     if not settings:
         await message.answer("❌ Nessun utente nel foglio Notifiche.")
         return
@@ -1246,7 +1284,7 @@ async def notif_admin_user_handler(cb: CallbackQuery):
         await cb.answer("❌ Non autorizzato.", show_alert=True)
         return
     uid = int(cb.data.split(":")[2])
-    settings = await asyncio.to_thread(get_notifiche_settings)
+    settings = await sheets_call(get_notifiche_settings)
     if uid not in settings:
         await cb.answer("Utente non trovato.", show_alert=True)
         return
@@ -1281,7 +1319,7 @@ async def notif_admin_list_handler(cb: CallbackQuery):
     if cb.from_user.id not in ADMINS:
         await cb.answer("❌ Non autorizzato.", show_alert=True)
         return
-    settings = await asyncio.to_thread(get_notifiche_settings)
+    settings = await sheets_call(get_notifiche_settings)
     kb = InlineKeyboardBuilder()
     for uid, cfg in settings.items():
         stato = "✅" if (cfg["reminder_ingresso"] or cfg["reminder_uscita"]) else "❌"
@@ -1306,7 +1344,7 @@ async def notif_toggle_handler(cb: CallbackQuery):
         await cb.answer("❌ Non autorizzato.", show_alert=True)
         return
 
-    new_val = await asyncio.to_thread(toggle_notifica, uid, tipo)
+    new_val = await sheets_call(toggle_notifica, uid, tipo)
     if new_val is None:
         await cb.answer("❌ Errore nel salvataggio.", show_alert=True)
         return
@@ -1316,7 +1354,7 @@ async def notif_toggle_handler(cb: CallbackQuery):
     await cb.answer(f"Reminder {tipo_str} {stato}!")
 
     # Aggiorna la tastiera con i nuovi valori
-    settings = await asyncio.to_thread(get_notifiche_settings)
+    settings = await sheets_call(get_notifiche_settings)
     if uid not in settings:
         return
     cfg = settings[uid]
@@ -1367,7 +1405,7 @@ async def notif_set_orario_receive(message: Message, state: FSMContext):
     tipo = data["notif_tipo"]
     await state.clear()
 
-    ok = await asyncio.to_thread(set_orario_notifica, uid, tipo, testo)
+    ok = await sheets_call(set_orario_notifica, uid, tipo, testo)
     tipo_str = "ingresso" if tipo == "in" else "uscita"
     if ok:
         await message.answer(
@@ -1386,7 +1424,7 @@ async def remindtest_handler(message: Message):
         return
     await message.answer("⏳ Eseguo test scheduler (simulo un check immediato)…")
     # Forza l'ora corrente come se fosse l'orario configurato per ogni utente
-    settings = await asyncio.to_thread(get_notifiche_settings)
+    settings = await sheets_call(get_notifiche_settings)
     count = 0
     for uid, cfg in settings.items():
         if cfg["reminder_ingresso"]:
@@ -1436,7 +1474,7 @@ async def status_handler(message: Message):
 
     # 4. Google Sheets
     try:
-        await asyncio.to_thread(get_sheet, "Registro")
+        await sheets_call(get_sheet, "Registro")
         lines.append("📊 <b>Google Sheets:</b> ✅ connesso")
     except Exception as e:
         lines.append(f"📊 <b>Google Sheets:</b> ❌ errore: {e}")
@@ -1458,8 +1496,26 @@ async def status_handler(message: Message):
 # ============================================================
 # FastAPI + lifecycle
 # ============================================================
+def _handle_task_exception(loop, context):
+    """
+    Cattura le eccezioni nei task asyncio che altrimenti morirebbero
+    in silenzio senza far crashare il processo ma lasciando il bot
+    in uno stato inconsistente.
+    """
+    exc = context.get("exception")
+    msg = context.get("message", "Errore sconosciuto nel task")
+    if exc:
+        logger.exception("Eccezione non gestita in task asyncio: %s", msg, exc_info=exc)
+    else:
+        logger.error("Errore in task asyncio: %s", msg)
+
+
 async def on_startup() -> None:
-    await asyncio.to_thread(init_sheets)
+    # Registra handler globale per eccezioni nei task
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(_handle_task_exception)
+
+    await sheets_call(init_sheets)
 
     # Registra il webhook su Telegram
     if WEBHOOK_URL:
@@ -1549,7 +1605,7 @@ async def debug_endpoint():
         result["telegram_webhook_error"] = str(e)
 
     try:
-        await asyncio.to_thread(get_sheet, "Registro")
+        await sheets_call(get_sheet, "Registro")
         result["google_sheets"] = "ok"
     except Exception as e:
         result["google_sheets"] = f"ERRORE: {e}"
