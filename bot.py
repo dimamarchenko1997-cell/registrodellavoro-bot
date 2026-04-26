@@ -1,4 +1,4 @@
-eimport ose
+import ose
 import asyncio
 import calendar
 import json
