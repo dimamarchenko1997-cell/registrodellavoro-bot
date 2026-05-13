@@ -1106,7 +1106,7 @@ async def lavoro_start(message: Message, state: FSMContext):
     await state.set_state(LavoroForm.waiting_for_bus)
     await message.answer(
         "🚌 <b>Registrazione Lavoro</b>\n\n"
-        "Inserisci il <b>numero del bus</b> su cui hai lavorato:",
+        "Inserisci il <b>numero del bus</b> su cui lavori:",
         reply_markup=types.ReplyKeyboardRemove(),
     )
 
