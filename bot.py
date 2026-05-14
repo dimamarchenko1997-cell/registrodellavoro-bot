@@ -425,6 +425,139 @@ async def async_get_lavori_giorno(user_id_str: str, giorno: str) -> List[dict]:
     return await sheets_call(_sync_get_lavori_giorno, user_id_str, giorno)
 
 
+# ============================================================
+# Google Sheets helpers – Appunti
+# ============================================================
+# Struttura foglio "Appunti":
+# Col A: ID (numero progressivo)  B: Telegram ID  C: Testo appunto  D: Data creazione
+
+def _sync_get_appunti(user_id: int) -> List[dict]:
+    """Restituisce tutti gli appunti dell'utente come lista di dict."""
+    try:
+        sheet = get_sheet("Appunti")
+        rows = sheet.get_all_values()
+        result = []
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) < 3:
+                continue
+            if row[1].strip() != str(user_id):
+                continue
+            result.append({
+                "row": i,
+                "id": row[0].strip(),
+                "testo": row[2].strip(),
+                "data": row[3].strip() if len(row) > 3 else "",
+            })
+        return result
+    except Exception as e:
+        logger.exception("Errore get_appunti: %s", e)
+        return []
+
+
+def _sync_add_appunto(user_id: int, testo: str) -> bool:
+    """Aggiunge un nuovo appunto nel foglio Appunti."""
+    try:
+        sheet = get_sheet("Appunti")
+        rows = sheet.get_all_values()
+        # Calcola il prossimo ID progressivo per questo utente
+        ids_utente = [
+            int(r[0]) for r in rows[1:]
+            if len(r) >= 2 and r[1].strip() == str(user_id)
+            and r[0].strip().isdigit()
+        ]
+        next_id = (max(ids_utente) + 1) if ids_utente else 1
+        now_local = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+        sheet.append_row([str(next_id), str(user_id), testo, now_local])
+        return True
+    except Exception as e:
+        logger.exception("Errore add_appunto: %s", e)
+        return False
+
+
+def _sync_delete_appunto(user_id: int, row_index: int) -> bool:
+    """Elimina la riga specificata dal foglio Appunti (verifica che appartenga all'utente)."""
+    try:
+        sheet = get_sheet("Appunti")
+        row = sheet.row_values(row_index)
+        if len(row) < 2 or row[1].strip() != str(user_id):
+            return False
+        sheet.delete_rows(row_index)
+        return True
+    except Exception as e:
+        logger.exception("Errore delete_appunto: %s", e)
+        return False
+
+
+def _sync_edit_appunto(user_id: int, row_index: int, nuovo_testo: str) -> bool:
+    """Modifica il testo di un appunto esistente."""
+    try:
+        sheet = get_sheet("Appunti")
+        row = sheet.row_values(row_index)
+        if len(row) < 2 or row[1].strip() != str(user_id):
+            return False
+        sheet.update_cell(row_index, 3, nuovo_testo)
+        return True
+    except Exception as e:
+        logger.exception("Errore edit_appunto: %s", e)
+        return False
+
+
+async def async_get_appunti(user_id: int) -> List[dict]:
+    return await sheets_call(_sync_get_appunti, user_id)
+
+async def async_add_appunto(user_id: int, testo: str) -> bool:
+    return await sheets_call(_sync_add_appunto, user_id, testo)
+
+async def async_delete_appunto(user_id: int, row_index: int) -> bool:
+    return await sheets_call(_sync_delete_appunto, user_id, row_index)
+
+async def async_edit_appunto(user_id: int, row_index: int, nuovo_testo: str) -> bool:
+    return await sheets_call(_sync_edit_appunto, user_id, row_index, nuovo_testo)
+
+
+def _setup_appunti_formatting(sheet_app: Worksheet) -> None:
+    """Formattazione intestazione foglio Appunti."""
+    try:
+        sid = sheet_app.id
+        sheet_app.format("A1:D1", {
+            "backgroundColor": {"red": 0.18, "green": 0.44, "blue": 0.31},
+            "textFormat": {
+                "bold": True,
+                "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                "fontSize": 11,
+            },
+            "horizontalAlignment": "CENTER",
+        })
+        sheet_app.spreadsheet.batch_update({"requests": [
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sid,
+                        "gridProperties": {"frozenRowCount": 1},
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            },
+            *[
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": sid,
+                            "dimension": "COLUMNS",
+                            "startIndex": i,
+                            "endIndex": i + 1,
+                        },
+                        "properties": {"pixelSize": size},
+                        "fields": "pixelSize",
+                    }
+                }
+                for i, size in enumerate([50, 120, 400, 140])
+            ],
+        ]})
+    except Exception as e:
+        logger.warning("Formattazione Appunti non applicata: %s", e)
+
+
 def _setup_produttivita_formatting(sheet_prod: Worksheet) -> None:
     """
     Applica formattazione completa al foglio Produttività:
@@ -567,6 +700,15 @@ def init_sheets() -> None:
         except Exception as e:
             logger.warning("Produttività sheet init warning: %s", e)
 
+        # ── Appunti ───────────────────────────────────────────
+        try:
+            sheet_app = get_sheet("Appunti")
+            if not sheet_app.row_values(1):
+                sheet_app.append_row(["ID", "Telegram ID", "Testo", "Data creazione"])
+                _setup_appunti_formatting(sheet_app)
+        except Exception as e:
+            logger.warning("Appunti sheet init warning: %s", e)
+
         logger.info("Sheets inizializzati.")
     except Exception as e:
         logger.error("Errore init_sheets: %s", e)
@@ -683,6 +825,7 @@ main_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="🚪 Uscita")],
         [KeyboardButton(text="🔧 Registra Lavoro")],
         [KeyboardButton(text="📆 Calendario Lavori")],
+        [KeyboardButton(text="📋 I miei Appunti")],
         [KeyboardButton(text="📝 Richiesta permessi")],
         [KeyboardButton(text="📄 Riepilogo")],
         [KeyboardButton(text="🔔 Mie Notifiche")],
@@ -720,6 +863,10 @@ class LavoroForm(StatesGroup):
     waiting_for_bus = State()
     waiting_for_tipo = State()
     waiting_for_note = State()
+
+class AppuntiForm(StatesGroup):
+    waiting_for_testo = State()       # testo del nuovo appunto
+    waiting_for_edit_testo = State()  # testo modificato di un appunto esistente
 
 class NotificheForm(StatesGroup):
     waiting_for_orario = State()
@@ -1094,8 +1241,21 @@ def _build_tipo_lavoro_kb() -> types.InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def _build_note_kb() -> types.InlineKeyboardMarkup:
+def _build_note_kb(appunti: List[dict]) -> types.InlineKeyboardMarkup:
+    """
+    Costruisce la keyboard per la selezione/inserimento note.
+    Mostra gli appunti salvati dell'utente come bottoni veloci (max 8),
+    più i tasti per scrivere una nota libera, saltare e gestire gli appunti.
+    """
     kb = InlineKeyboardBuilder()
+    # Bottoni veloci per ogni appunto salvato (max 8 per non esplodere la UI)
+    for app in appunti[:8]:
+        testo_breve = app["testo"][:40] + ("…" if len(app["testo"]) > 40 else "")
+        kb.button(
+            text=f"💬 {testo_breve}",
+            callback_data=f"lavoro_note:appunto:{app['row']}"
+        )
+    kb.button(text="✏️ Scrivi nota libera", callback_data="lavoro_note:libera")
     kb.button(text="⏭️ Salta (nessuna nota)", callback_data="lavoro_note:skip")
     kb.adjust(1)
     return kb.as_markup()
@@ -1106,7 +1266,7 @@ async def lavoro_start(message: Message, state: FSMContext):
     await state.set_state(LavoroForm.waiting_for_bus)
     await message.answer(
         "🚌 <b>Registrazione Lavoro</b>\n\n"
-        "Inserisci il <b>numero del bus</b> su cui lavori:",
+        "Inserisci il <b>numero del bus</b> su cui hai lavorato:",
         reply_markup=types.ReplyKeyboardRemove(),
     )
 
@@ -1135,11 +1295,61 @@ async def lavoro_tipo(cb: CallbackQuery, state: FSMContext):
     tipo = cb.data.split(":", 1)[1]
     await state.update_data(tipo=tipo)
     await state.set_state(LavoroForm.waiting_for_note)
+
+    # Carica gli appunti salvati per mostrare i bottoni veloci
+    try:
+        appunti = await async_get_appunti(cb.from_user.id)
+    except asyncio.TimeoutError:
+        appunti = []
+
+    if appunti:
+        testo_kb = (
+            f"✅ Tipo: <b>{tipo}</b>\n\n"
+            "📝 <b>Note:</b> seleziona un appunto salvato, scrivi una nota libera, oppure salta:"
+        )
+    else:
+        testo_kb = (
+            f"✅ Tipo: <b>{tipo}</b>\n\n"
+            "📝 Vuoi aggiungere delle <b>note</b>?\n"
+            "Scrivile qui sotto, oppure premi il bottone per saltare:"
+        )
+
+    await cb.message.edit_text(testo_kb, reply_markup=_build_note_kb(appunti))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("lavoro_note:appunto:"))
+async def lavoro_note_da_appunto(cb: CallbackQuery, state: FSMContext):
+    """L'utente ha selezionato un appunto salvato come nota veloce."""
+    current = await state.get_state()
+    if current != LavoroForm.waiting_for_note:
+        await cb.answer()
+        return
+    row_index = int(cb.data.split(":", 2)[2])
+    # Recupera il testo dell'appunto dalla riga specificata
+    try:
+        appunti = await async_get_appunti(cb.from_user.id)
+    except asyncio.TimeoutError:
+        await cb.answer("⚠️ Timeout, riprova.", show_alert=True)
+        return
+    appunto = next((a for a in appunti if a["row"] == row_index), None)
+    if not appunto:
+        await cb.answer("⚠️ Appunto non trovato.", show_alert=True)
+        return
+    await cb.answer()
+    await _salva_lavoro(cb.message, state, appunto["testo"], from_user=cb.from_user)
+
+
+@dp.callback_query(F.data == "lavoro_note:libera")
+async def lavoro_note_libera(cb: CallbackQuery, state: FSMContext):
+    """L'utente vuole scrivere una nota libera: rimuovi la keyboard e attendi testo."""
+    current = await state.get_state()
+    if current != LavoroForm.waiting_for_note:
+        await cb.answer()
+        return
     await cb.message.edit_text(
-        f"✅ Tipo: <b>{tipo}</b>\n\n"
-        "📝 Vuoi aggiungere delle <b>note</b>?\n"
-        "Scrivile qui sotto, oppure premi il bottone per saltare:",
-        reply_markup=_build_note_kb(),
+        "✏️ Scrivi la nota da aggiungere al lavoro:\n\n"
+        "<i>Invia il testo e verrà salvato. Puoi anche aggiungerlo ai tuoi appunti dopo.</i>"
     )
     await cb.answer()
 
@@ -1185,9 +1395,286 @@ async def _salva_lavoro(
             f"🔧 Tipo: <b>{tipo}</b>\n"
             f"📝 Note: {note if note else '—'}"
         )
-        await message.answer(riepilogo, reply_markup=main_kb)
+        # Se c'è una nota libera, offri di salvarla negli appunti
+        if note:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="💾 Salva questa nota negli appunti", callback_data=f"appunto_salva_rapido:{note[:200]}")
+            kb.adjust(1)
+            await message.answer(riepilogo, reply_markup=kb.as_markup())
+            # Manda anche la main_kb in un messaggio separato
+            await message.answer("Scegli un'opzione:", reply_markup=main_kb)
+        else:
+            await message.answer(riepilogo, reply_markup=main_kb)
     else:
         await message.answer("❌ Errore durante il salvataggio. Riprova.", reply_markup=main_kb)
+
+
+@dp.callback_query(F.data.startswith("appunto_salva_rapido:"))
+async def appunto_salva_rapido_handler(cb: CallbackQuery):
+    """Salva la nota appena usata come nuovo appunto direttamente dalla conferma lavoro."""
+    testo = cb.data.split(":", 1)[1]
+    try:
+        ok = await async_add_appunto(cb.from_user.id, testo)
+    except asyncio.TimeoutError:
+        await cb.answer("⚠️ Timeout, riprova.", show_alert=True)
+        return
+    if ok:
+        await cb.answer("✅ Nota salvata negli appunti!", show_alert=False)
+        await cb.message.edit_reply_markup(reply_markup=None)
+    else:
+        await cb.answer("❌ Errore nel salvataggio.", show_alert=True)
+
+
+# ============================================================
+# Handlers – Appunti (gestione completa)
+# ============================================================
+
+def _build_appunti_lista_kb(appunti: List[dict]) -> types.InlineKeyboardMarkup:
+    """Keyboard elenco appunti: ogni appunto ha bottone per visualizzarlo/modificarlo."""
+    kb = InlineKeyboardBuilder()
+    for app in appunti:
+        testo_breve = app["testo"][:35] + ("…" if len(app["testo"]) > 35 else "")
+        kb.button(
+            text=f"📌 {testo_breve}",
+            callback_data=f"appunto:view:{app['row']}"
+        )
+    kb.button(text="➕ Nuovo appunto", callback_data="appunto:new")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _build_appunto_detail_kb(row_index: int) -> types.InlineKeyboardMarkup:
+    """Keyboard dettaglio singolo appunto: modifica, elimina, torna alla lista."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Modifica", callback_data=f"appunto:edit:{row_index}")
+    kb.button(text="🗑️ Elimina", callback_data=f"appunto:delete:{row_index}")
+    kb.button(text="🔙 Torna agli appunti", callback_data="appunto:list")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+@dp.message(F.text == "📋 I miei Appunti")
+async def appunti_handler(message: Message):
+    """Mostra la lista degli appunti salvati dell'utente."""
+    try:
+        appunti = await async_get_appunti(message.from_user.id)
+    except asyncio.TimeoutError:
+        await message.answer("⚠️ Il server è lento, riprova tra qualche secondo.", reply_markup=main_kb)
+        return
+
+    if not appunti:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="➕ Crea il tuo primo appunto", callback_data="appunto:new")
+        kb.adjust(1)
+        await message.answer(
+            "📋 <b>I miei Appunti</b>\n\n"
+            "Non hai ancora nessun appunto salvato.\n"
+            "Gli appunti sono <b>note veloci</b> riutilizzabili durante la registrazione dei lavori.",
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        await message.answer(
+            f"📋 <b>I miei Appunti</b> ({len(appunti)} salvati)\n\n"
+            "Tocca un appunto per vederlo, modificarlo o eliminarlo.\n"
+            "Puoi usarli come <b>note veloci</b> durante la registrazione lavori.",
+            reply_markup=_build_appunti_lista_kb(appunti),
+        )
+
+
+@dp.callback_query(F.data == "appunto:list")
+async def appunto_list_handler(cb: CallbackQuery):
+    """Torna alla lista appunti (usato dal dettaglio)."""
+    try:
+        appunti = await async_get_appunti(cb.from_user.id)
+    except asyncio.TimeoutError:
+        await cb.answer("⚠️ Timeout, riprova.", show_alert=True)
+        return
+
+    if not appunti:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="➕ Crea il tuo primo appunto", callback_data="appunto:new")
+        kb.adjust(1)
+        await cb.message.edit_text(
+            "📋 <b>I miei Appunti</b>\n\nNessun appunto salvato.",
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        await cb.message.edit_text(
+            f"📋 <b>I miei Appunti</b> ({len(appunti)} salvati)\n\n"
+            "Tocca un appunto per vederlo, modificarlo o eliminarlo.",
+            reply_markup=_build_appunti_lista_kb(appunti),
+        )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "appunto:new")
+async def appunto_new_handler(cb: CallbackQuery, state: FSMContext):
+    """Avvia la creazione di un nuovo appunto."""
+    await state.set_state(AppuntiForm.waiting_for_testo)
+    await cb.message.edit_text(
+        "➕ <b>Nuovo Appunto</b>\n\n"
+        "Scrivi il testo dell'appunto.\n"
+        "<i>Esempio: «Sostituzione display anteriore», «Controllo freni», «Pulizia motore»…</i>"
+    )
+    await cb.answer()
+
+
+@dp.message(AppuntiForm.waiting_for_testo)
+async def appunto_testo_handler(message: Message, state: FSMContext):
+    """Riceve il testo del nuovo appunto e lo salva."""
+    testo = (message.text or "").strip()
+    if not testo:
+        await message.answer("⚠️ Il testo non può essere vuoto. Scrivi qualcosa:")
+        return
+    if len(testo) > 300:
+        await message.answer("⚠️ Testo troppo lungo (max 300 caratteri). Riprova:")
+        return
+    await state.clear()
+    try:
+        ok = await async_add_appunto(message.from_user.id, testo)
+    except asyncio.TimeoutError:
+        await message.answer("⚠️ Timeout salvataggio, riprova.", reply_markup=main_kb)
+        return
+    if ok:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📋 Vedi tutti gli appunti", callback_data="appunto:list")
+        kb.button(text="➕ Aggiungi un altro", callback_data="appunto:new")
+        kb.adjust(1)
+        await message.answer(
+            f"✅ <b>Appunto salvato!</b>\n\n<i>«{testo}»</i>",
+            reply_markup=kb.as_markup(),
+        )
+        await message.answer("Scegli un'opzione:", reply_markup=main_kb)
+    else:
+        await message.answer("❌ Errore nel salvataggio. Riprova.", reply_markup=main_kb)
+
+
+@dp.callback_query(F.data.startswith("appunto:view:"))
+async def appunto_view_handler(cb: CallbackQuery):
+    """Mostra il dettaglio di un singolo appunto con opzioni modifica/elimina."""
+    row_index = int(cb.data.split(":")[2])
+    try:
+        appunti = await async_get_appunti(cb.from_user.id)
+    except asyncio.TimeoutError:
+        await cb.answer("⚠️ Timeout, riprova.", show_alert=True)
+        return
+    appunto = next((a for a in appunti if a["row"] == row_index), None)
+    if not appunto:
+        await cb.answer("⚠️ Appunto non trovato (potrebbe essere stato eliminato).", show_alert=True)
+        return
+    data_str = f"\n<i>Creato il {appunto['data']}</i>" if appunto["data"] else ""
+    await cb.message.edit_text(
+        f"📌 <b>Appunto</b>\n\n{appunto['testo']}{data_str}",
+        reply_markup=_build_appunto_detail_kb(row_index),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("appunto:edit:"))
+async def appunto_edit_start(cb: CallbackQuery, state: FSMContext):
+    """Avvia la modifica di un appunto."""
+    row_index = int(cb.data.split(":")[2])
+    # Recupera il testo attuale
+    try:
+        appunti = await async_get_appunti(cb.from_user.id)
+    except asyncio.TimeoutError:
+        await cb.answer("⚠️ Timeout, riprova.", show_alert=True)
+        return
+    appunto = next((a for a in appunti if a["row"] == row_index), None)
+    if not appunto:
+        await cb.answer("⚠️ Appunto non trovato.", show_alert=True)
+        return
+    await state.update_data(editing_appunto_row=row_index)
+    await state.set_state(AppuntiForm.waiting_for_edit_testo)
+    await cb.message.edit_text(
+        f"✏️ <b>Modifica Appunto</b>\n\n"
+        f"Testo attuale:\n<i>«{appunto['testo']}»</i>\n\n"
+        "Scrivi il nuovo testo (o scrivi <b>Annulla</b> per tornare indietro):"
+    )
+    await cb.answer()
+
+
+@dp.message(AppuntiForm.waiting_for_edit_testo)
+async def appunto_edit_testo_handler(message: Message, state: FSMContext):
+    """Riceve il nuovo testo e aggiorna l'appunto."""
+    if (message.text or "").strip().lower() == "annulla":
+        await state.clear()
+        await message.answer("❌ Modifica annullata.", reply_markup=main_kb)
+        return
+    nuovo_testo = (message.text or "").strip()
+    if not nuovo_testo:
+        await message.answer("⚠️ Il testo non può essere vuoto. Scrivi qualcosa:")
+        return
+    if len(nuovo_testo) > 300:
+        await message.answer("⚠️ Testo troppo lungo (max 300 caratteri). Riprova:")
+        return
+    data = await state.get_data()
+    row_index = data.get("editing_appunto_row")
+    await state.clear()
+    try:
+        ok = await async_edit_appunto(message.from_user.id, row_index, nuovo_testo)
+    except asyncio.TimeoutError:
+        await message.answer("⚠️ Timeout, riprova.", reply_markup=main_kb)
+        return
+    if ok:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📋 Vedi tutti gli appunti", callback_data="appunto:list")
+        kb.adjust(1)
+        await message.answer(
+            f"✅ <b>Appunto aggiornato!</b>\n\n<i>«{nuovo_testo}»</i>",
+            reply_markup=kb.as_markup(),
+        )
+        await message.answer("Scegli un'opzione:", reply_markup=main_kb)
+    else:
+        await message.answer("❌ Errore nell'aggiornamento. Riprova.", reply_markup=main_kb)
+
+
+@dp.callback_query(F.data.startswith("appunto:delete:"))
+async def appunto_delete_confirm(cb: CallbackQuery):
+    """Chiede conferma prima di eliminare l'appunto."""
+    row_index = int(cb.data.split(":")[2])
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Sì, elimina", callback_data=f"appunto:confirm_delete:{row_index}")
+    kb.button(text="❌ Annulla", callback_data=f"appunto:view:{row_index}")
+    kb.adjust(2)
+    await cb.message.edit_text(
+        "🗑️ <b>Conferma eliminazione</b>\n\nSei sicuro di voler eliminare questo appunto?\nNon sarà più disponibile come nota veloce.",
+        reply_markup=kb.as_markup(),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("appunto:confirm_delete:"))
+async def appunto_confirm_delete_handler(cb: CallbackQuery):
+    """Esegue la cancellazione dell'appunto."""
+    row_index = int(cb.data.split(":")[2])
+    try:
+        ok = await async_delete_appunto(cb.from_user.id, row_index)
+    except asyncio.TimeoutError:
+        await cb.answer("⚠️ Timeout, riprova.", show_alert=True)
+        return
+    if ok:
+        # Ricarica la lista aggiornata
+        try:
+            appunti = await async_get_appunti(cb.from_user.id)
+        except asyncio.TimeoutError:
+            appunti = []
+        if appunti:
+            await cb.message.edit_text(
+                f"✅ Appunto eliminato.\n\n📋 <b>I miei Appunti</b> ({len(appunti)} rimasti)",
+                reply_markup=_build_appunti_lista_kb(appunti),
+            )
+        else:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="➕ Crea il tuo primo appunto", callback_data="appunto:new")
+            kb.adjust(1)
+            await cb.message.edit_text(
+                "✅ Appunto eliminato.\n\n📋 Non hai altri appunti salvati.",
+                reply_markup=kb.as_markup(),
+            )
+    else:
+        await cb.answer("❌ Errore nell'eliminazione.", show_alert=True)
+    await cb.answer()
 
 
 # ============================================================
