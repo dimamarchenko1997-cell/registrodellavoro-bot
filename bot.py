@@ -1337,7 +1337,7 @@ async def lavoro_note_da_appunto(cb: CallbackQuery, state: FSMContext):
         await cb.answer("⚠️ Appunto non trovato.", show_alert=True)
         return
     await cb.answer()
-    await _salva_lavoro(cb.message, state, appunto["testo"], from_user=cb.from_user)
+    await _salva_lavoro(cb.message.chat.id, state, appunto["testo"], user=cb.from_user)
 
 
 @dp.callback_query(F.data == "lavoro_note:libera")
@@ -1357,7 +1357,7 @@ async def lavoro_note_libera(cb: CallbackQuery, state: FSMContext):
 @dp.message(LavoroForm.waiting_for_note)
 async def lavoro_note_testo(message: Message, state: FSMContext):
     note = (message.text or "").strip()
-    await _salva_lavoro(message, state, note)
+    await _salva_lavoro(message.chat.id, state, note, user=message.from_user)
 
 
 @dp.callback_query(F.data == "lavoro_note:skip")
@@ -1367,25 +1367,29 @@ async def lavoro_note_skip(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     await cb.answer()
-    await _salva_lavoro(cb.message, state, "", from_user=cb.from_user)
+    await _salva_lavoro(cb.message.chat.id, state, "", user=cb.from_user)
 
 
 async def _salva_lavoro(
-    message: Message,
+    chat_id: int,
     state: FSMContext,
     note: str,
-    from_user: Optional[types.User] = None,
+    user: types.User,
 ) -> None:
+    """
+    Salva il lavoro e invia sempre il riepilogo via bot.send_message(chat_id).
+    Usando chat_id esplicito (invece di message.answer) evitiamo il bug per cui
+    cb.message non restituisce la ReplyKeyboard all'utente dopo un'interazione inline.
+    """
     data = await state.get_data()
     numero_bus = data.get("numero_bus", "")
     tipo = data.get("tipo", "")
     await state.clear()
 
-    user = from_user or message.from_user
     try:
         ok = await async_save_lavoro(user, numero_bus, tipo, note)
     except asyncio.TimeoutError:
-        await message.answer("⚠️ Timeout salvataggio, riprova tra qualche secondo.", reply_markup=main_kb)
+        await bot.send_message(chat_id, "⚠️ Timeout salvataggio, riprova tra qualche secondo.", reply_markup=main_kb)
         return
 
     if ok:
@@ -1395,18 +1399,19 @@ async def _salva_lavoro(
             f"🔧 Tipo: <b>{tipo}</b>\n"
             f"📝 Note: {note if note else '—'}"
         )
-        # Se c'è una nota libera, offri di salvarla negli appunti
         if note:
+            # Offri di salvare la nota negli appunti, poi ripristina la main_kb
             kb = InlineKeyboardBuilder()
-            kb.button(text="💾 Salva questa nota negli appunti", callback_data=f"appunto_salva_rapido:{note[:200]}")
+            kb.button(
+                text="💾 Salva questa nota negli appunti",
+                callback_data=f"appunto_salva_rapido:{note[:200]}"
+            )
             kb.adjust(1)
-            await message.answer(riepilogo, reply_markup=kb.as_markup())
-            # Manda anche la main_kb in un messaggio separato
-            await message.answer("Scegli un'opzione:", reply_markup=main_kb)
-        else:
-            await message.answer(riepilogo, reply_markup=main_kb)
+            await bot.send_message(chat_id, riepilogo, reply_markup=kb.as_markup())
+        # Manda sempre un messaggio separato con la main_kb per ripristinarla
+        await bot.send_message(chat_id, "Scegli un'opzione:", reply_markup=main_kb)
     else:
-        await message.answer("❌ Errore durante il salvataggio. Riprova.", reply_markup=main_kb)
+        await bot.send_message(chat_id, "❌ Errore durante il salvataggio. Riprova.", reply_markup=main_kb)
 
 
 @dp.callback_query(F.data.startswith("appunto_salva_rapido:"))
