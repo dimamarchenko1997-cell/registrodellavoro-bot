@@ -8,7 +8,7 @@ import logging
 import re
 from datetime import datetime, date
 from math import radians, sin, cos, sqrt, atan2
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, Union
 
 from dotenv import load_dotenv
 import pytz
@@ -1326,7 +1326,6 @@ async def lavoro_note_da_appunto(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     row_index = int(cb.data.split(":", 2)[2])
-    # Recupera il testo dell'appunto dalla riga specificata
     try:
         appunti = await async_get_appunti(cb.from_user.id)
     except asyncio.TimeoutError:
@@ -1337,59 +1336,86 @@ async def lavoro_note_da_appunto(cb: CallbackQuery, state: FSMContext):
         await cb.answer("⚠️ Appunto non trovato.", show_alert=True)
         return
     await cb.answer()
-    await _salva_lavoro(cb.message.chat.id, state, appunto["testo"], user=cb.from_user)
+    await _salva_lavoro(cb, state, appunto["testo"], user=cb.from_user)
 
 
 @dp.callback_query(F.data == "lavoro_note:libera")
 async def lavoro_note_libera(cb: CallbackQuery, state: FSMContext):
-    """L'utente vuole scrivere una nota libera: rimuovi la keyboard e attendi testo."""
+    """L'utente vuole scrivere una nota libera: modifica il messaggio e attendi testo."""
     current = await state.get_state()
     if current != LavoroForm.waiting_for_note:
         await cb.answer()
         return
+    # Salva message_id per poterlo editare dopo che l'utente scrive la nota
+    await state.update_data(inline_msg_id=cb.message.message_id)
     await cb.message.edit_text(
-        "✏️ Scrivi la nota da aggiungere al lavoro:\n\n"
-        "<i>Invia il testo e verrà salvato. Puoi anche aggiungerlo ai tuoi appunti dopo.</i>"
+        "✏️ <b>Scrivi la nota</b> da aggiungere al lavoro:\n\n"
+        "<i>Digita il testo qui sotto e invia.</i>"
     )
     await cb.answer()
 
 
 @dp.message(LavoroForm.waiting_for_note)
 async def lavoro_note_testo(message: Message, state: FSMContext):
+    """L'utente ha scritto la nota libera."""
     note = (message.text or "").strip()
-    await _salva_lavoro(message.chat.id, state, note, user=message.from_user)
+    if not note:
+        await message.answer("⚠️ La nota non può essere vuota. Scrivi qualcosa oppure premi Salta.")
+        return
+    await _salva_lavoro(message, state, note, user=message.from_user)
 
 
 @dp.callback_query(F.data == "lavoro_note:skip")
 async def lavoro_note_skip(cb: CallbackQuery, state: FSMContext):
+    """L'utente salta la nota."""
     current = await state.get_state()
     if current != LavoroForm.waiting_for_note:
         await cb.answer()
         return
     await cb.answer()
-    await _salva_lavoro(cb.message.chat.id, state, "", user=cb.from_user)
+    await _salva_lavoro(cb, state, "", user=cb.from_user)
 
 
 async def _salva_lavoro(
-    chat_id: int,
+    trigger: Union[CallbackQuery, Message],
     state: FSMContext,
     note: str,
     user: types.User,
 ) -> None:
     """
-    Salva il lavoro e invia sempre il riepilogo via bot.send_message(chat_id).
-    Usando chat_id esplicito (invece di message.answer) evitiamo il bug per cui
-    cb.message non restituisce la ReplyKeyboard all'utente dopo un'interazione inline.
+    Salva il lavoro su Sheets e mostra il riepilogo con la main_kb.
+
+    Strategia output a seconda del trigger:
+    - CallbackQuery  → edit_text sul messaggio inline (feedback immediato,
+                       nessun bottone residuo) + send_message per riepilogo + main_kb
+    - Message        → il messaggio inline precedente (nota libera) è già stato editato
+                       da lavoro_note_libera; qui basta send_message per riepilogo + main_kb
     """
     data = await state.get_data()
     numero_bus = data.get("numero_bus", "")
     tipo = data.get("tipo", "")
+    chat_id = (
+        trigger.message.chat.id
+        if isinstance(trigger, CallbackQuery)
+        else trigger.chat.id
+    )
     await state.clear()
+
+    # Feedback immediato: rimuovi i bottoni inline dal messaggio precedente
+    if isinstance(trigger, CallbackQuery):
+        try:
+            await trigger.message.edit_text("⏳ Salvataggio in corso…")
+        except Exception:
+            pass
 
     try:
         ok = await async_save_lavoro(user, numero_bus, tipo, note)
     except asyncio.TimeoutError:
-        await bot.send_message(chat_id, "⚠️ Timeout salvataggio, riprova tra qualche secondo.", reply_markup=main_kb)
+        await bot.send_message(
+            chat_id,
+            "⚠️ Timeout salvataggio, riprova tra qualche secondo.",
+            reply_markup=main_kb,
+        )
         return
 
     if ok:
@@ -1400,18 +1426,24 @@ async def _salva_lavoro(
             f"📝 Note: {note if note else '—'}"
         )
         if note:
-            # Offri di salvare la nota negli appunti, poi ripristina la main_kb
-            kb = InlineKeyboardBuilder()
-            kb.button(
+            # Proponi di salvare la nota come appunto futuro
+            kb_salva = InlineKeyboardBuilder()
+            kb_salva.button(
                 text="💾 Salva questa nota negli appunti",
-                callback_data=f"appunto_salva_rapido:{note[:200]}"
+                callback_data=f"appunto_salva_rapido:{note[:200]}",
             )
-            kb.adjust(1)
-            await bot.send_message(chat_id, riepilogo, reply_markup=kb.as_markup())
-        # Manda sempre un messaggio separato con la main_kb per ripristinarla
+            kb_salva.adjust(1)
+            await bot.send_message(chat_id, riepilogo, reply_markup=kb_salva.as_markup())
+        else:
+            await bot.send_message(chat_id, riepilogo)
+        # Messaggio separato con la main_kb: garantisce che la tastiera riappaia sempre
         await bot.send_message(chat_id, "Scegli un'opzione:", reply_markup=main_kb)
     else:
-        await bot.send_message(chat_id, "❌ Errore durante il salvataggio. Riprova.", reply_markup=main_kb)
+        await bot.send_message(
+            chat_id,
+            "❌ Errore durante il salvataggio. Riprova.",
+            reply_markup=main_kb,
+        )
 
 
 @dp.callback_query(F.data.startswith("appunto_salva_rapido:"))
