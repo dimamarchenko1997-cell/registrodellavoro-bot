@@ -1372,18 +1372,27 @@ async def _salva_lavoro(
     is_cb = isinstance(trigger, CallbackQuery)
     chat_id = trigger.message.chat.id if is_cb else trigger.chat.id
 
-    # 1. Feedback visivo immediato: togli i bottoni inline
+    # 1. Feedback visivo immediato — rimuove i bottoni inline subito
     if is_cb:
         try:
             await trigger.message.edit_text("⏳ Salvataggio…")
         except Exception:
             pass
 
-    # 2. Salva su Sheets
+    # 2. Salva su Sheets — timeout fisso 12s, cattura TUTTO
+    ok = False
     try:
-        ok = await async_save_lavoro(user, numero_bus, tipo, note)
+        ok = await asyncio.wait_for(
+            asyncio.to_thread(_sync_save_lavoro, user, numero_bus, tipo, note),
+            timeout=12.0,
+        )
     except asyncio.TimeoutError:
-        await bot.send_message(chat_id, "⚠️ Timeout, riprova.", reply_markup=main_kb)
+        logger.error("_salva_lavoro: timeout Sheets per user %s", user.id)
+        await bot.send_message(chat_id, "⚠️ Il server è lento. Il lavoro potrebbe non essere stato salvato. Riprova.", reply_markup=main_kb)
+        return
+    except Exception as e:
+        logger.exception("_salva_lavoro: eccezione Sheets per user %s: %s", user.id, e)
+        await bot.send_message(chat_id, f"❌ Errore nel salvataggio: {e}", reply_markup=main_kb)
         return
 
     # 3. Riepilogo
@@ -1405,13 +1414,35 @@ async def _salva_lavoro(
         else:
             await bot.send_message(chat_id, riepilogo)
     else:
-        await bot.send_message(chat_id, "❌ Errore nel salvataggio. Riprova.")
+        await bot.send_message(chat_id, "❌ Errore nel salvataggio. Controlla i log.")
 
-    # 4. Ripristina sempre la main_kb con un messaggio dedicato
+    # 4. Ripristina sempre la main_kb
     await bot.send_message(chat_id, "Scegli un'opzione:", reply_markup=main_kb)
 
 
-@dp.callback_query(F.data.startswith("appunto_salva_rapido:"))
+@dp.message(F.data.startswith("appunto_salva_rapido:") if False else F.text == "/testlavoro")
+async def testlavoro_handler(message: Message):
+    """Admin: testa direttamente il salvataggio su foglio Produttività."""
+    if message.from_user.id not in ADMINS:
+        await message.answer("❌ Non autorizzato.")
+        return
+    await message.answer("⏳ Test salvataggio su foglio Produttività…")
+    try:
+        ok = await asyncio.wait_for(
+            asyncio.to_thread(_sync_save_lavoro, message.from_user, "TEST-99", "Test", "Riga di test /testlavoro"),
+            timeout=12.0,
+        )
+        if ok:
+            await message.answer("✅ Salvataggio riuscito! Controlla il foglio Produttività.", reply_markup=main_kb)
+        else:
+            await message.answer("❌ _sync_save_lavoro ha restituito False — controlla i log del server.", reply_markup=main_kb)
+    except asyncio.TimeoutError:
+        await message.answer("❌ TIMEOUT (>12s) — Google Sheets non risponde. Controlla le credenziali e il SHEET_ID.", reply_markup=main_kb)
+    except Exception as e:
+        await message.answer(f"❌ Eccezione: <code>{e}</code>", reply_markup=main_kb)
+
+
+
 async def appunto_salva_rapido_handler(cb: CallbackQuery):
     """Salva la nota appena usata come nuovo appunto direttamente dalla conferma lavoro."""
     testo = cb.data.split(":", 1)[1]
