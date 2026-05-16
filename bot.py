@@ -361,10 +361,6 @@ def _sync_save_lavoro(
 
 
 def _sync_get_lavori_mese(user_id_str: str, year: int, month: int) -> List[dict]:
-    """
-    Legge il foglio Produttività e restituisce tutte le righe dell'utente
-    per l'anno/mese specificati, come lista di dizionari.
-    """
     try:
         sheet = get_sheet("Produttività")
         rows = sheet.get_all_values()
@@ -391,10 +387,6 @@ def _sync_get_lavori_mese(user_id_str: str, year: int, month: int) -> List[dict]
 
 
 def _sync_get_lavori_giorno(user_id_str: str, giorno: str) -> List[dict]:
-    """
-    Legge il foglio Produttività e restituisce tutte le righe dell'utente
-    per il giorno specificato (formato DD.MM.YYYY).
-    """
     try:
         sheet = get_sheet("Produttività")
         rows = sheet.get_all_values()
@@ -432,7 +424,6 @@ async def async_get_lavori_giorno(user_id_str: str, giorno: str) -> List[dict]:
 # Col A: ID (numero progressivo)  B: Telegram ID  C: Testo appunto  D: Data creazione
 
 def _sync_get_appunti(user_id: int) -> List[dict]:
-    """Restituisce tutti gli appunti dell'utente come lista di dict."""
     try:
         sheet = get_sheet("Appunti")
         rows = sheet.get_all_values()
@@ -455,11 +446,9 @@ def _sync_get_appunti(user_id: int) -> List[dict]:
 
 
 def _sync_add_appunto(user_id: int, testo: str) -> bool:
-    """Aggiunge un nuovo appunto nel foglio Appunti."""
     try:
         sheet = get_sheet("Appunti")
         rows = sheet.get_all_values()
-        # Calcola il prossimo ID progressivo per questo utente
         ids_utente = [
             int(r[0]) for r in rows[1:]
             if len(r) >= 2 and r[1].strip() == str(user_id)
@@ -475,7 +464,6 @@ def _sync_add_appunto(user_id: int, testo: str) -> bool:
 
 
 def _sync_delete_appunto(user_id: int, row_index: int) -> bool:
-    """Elimina la riga specificata dal foglio Appunti (verifica che appartenga all'utente)."""
     try:
         sheet = get_sheet("Appunti")
         row = sheet.row_values(row_index)
@@ -489,7 +477,6 @@ def _sync_delete_appunto(user_id: int, row_index: int) -> bool:
 
 
 def _sync_edit_appunto(user_id: int, row_index: int, nuovo_testo: str) -> bool:
-    """Modifica il testo di un appunto esistente."""
     try:
         sheet = get_sheet("Appunti")
         row = sheet.row_values(row_index)
@@ -516,7 +503,6 @@ async def async_edit_appunto(user_id: int, row_index: int, nuovo_testo: str) -> 
 
 
 def _setup_appunti_formatting(sheet_app: Worksheet) -> None:
-    """Formattazione intestazione foglio Appunti."""
     try:
         sid = sheet_app.id
         sheet_app.format("A1:D1", {
@@ -559,17 +545,10 @@ def _setup_appunti_formatting(sheet_app: Worksheet) -> None:
 
 
 def _setup_produttivita_formatting(sheet_prod: Worksheet) -> None:
-    """
-    Applica formattazione completa al foglio Produttività:
-    - Intestazione colorata, freeze, filtro
-    - Formattazione condizionale alternata per data
-    - Larghezze colonne ottimizzate
-    """
     try:
         sid = sheet_prod.id
         spreadsheet = sheet_prod.spreadsheet
 
-        # Intestazione
         sheet_prod.format("A1:F1", {
             "backgroundColor": {"red": 0.13, "green": 0.27, "blue": 0.53},
             "textFormat": {
@@ -582,7 +561,6 @@ def _setup_produttivita_formatting(sheet_prod: Worksheet) -> None:
         })
 
         requests = [
-            # Freeze riga 1
             {
                 "updateSheetProperties": {
                     "properties": {
@@ -592,7 +570,6 @@ def _setup_produttivita_formatting(sheet_prod: Worksheet) -> None:
                     "fields": "gridProperties.frozenRowCount",
                 }
             },
-            # Filtro automatico
             {
                 "setBasicFilter": {
                     "filter": {
@@ -605,7 +582,6 @@ def _setup_produttivita_formatting(sheet_prod: Worksheet) -> None:
                     }
                 }
             },
-            # Formattazione condizionale righe pari (per data alternata)
             {
                 "addConditionalFormatRule": {
                     "rule": {
@@ -628,7 +604,6 @@ def _setup_produttivita_formatting(sheet_prod: Worksheet) -> None:
                     "index": 0,
                 }
             },
-            # Larghezze colonne: A=90, B=70, C=200, D=80, E=130, F=300
             *[
                 {
                     "updateDimensionProperties": {
@@ -644,7 +619,6 @@ def _setup_produttivita_formatting(sheet_prod: Worksheet) -> None:
                 }
                 for i, size in enumerate([90, 70, 200, 80, 130, 300])
             ],
-            # Altezza riga intestazione
             {
                 "updateDimensionProperties": {
                     "range": {
@@ -689,7 +663,6 @@ def init_sheets() -> None:
                 ])
         except Exception:
             pass
-        # ── Produttività ──────────────────────────────────────
         try:
             sheet_prod = get_sheet("Produttività")
             if not sheet_prod.row_values(1):
@@ -700,7 +673,6 @@ def init_sheets() -> None:
         except Exception as e:
             logger.warning("Produttività sheet init warning: %s", e)
 
-        # ── Appunti ───────────────────────────────────────────
         try:
             sheet_app = get_sheet("Appunti")
             if not sheet_app.row_values(1):
@@ -865,8 +837,8 @@ class LavoroForm(StatesGroup):
     waiting_for_note = State()
 
 class AppuntiForm(StatesGroup):
-    waiting_for_testo = State()       # testo del nuovo appunto
-    waiting_for_edit_testo = State()  # testo modificato di un appunto esistente
+    waiting_for_testo = State()
+    waiting_for_edit_testo = State()
 
 class NotificheForm(StatesGroup):
     waiting_for_orario = State()
@@ -920,21 +892,14 @@ def build_lavori_calendar(
     month: int,
     giorni_con_lavori: set,
 ) -> types.InlineKeyboardMarkup:
-    """
-    Costruisce il calendario mensile per i lavori.
-    I giorni con registrazioni sono evidenziati con ✅.
-    I giorni vuoti mostrano solo il numero.
-    """
     kb = InlineKeyboardBuilder()
     today = datetime.now(TIMEZONE)
     nomi_giorni = ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"]
 
-    # Riga titolo mese/anno
     kb.button(
         text=f"📆 {mese_nome(month)} {year}",
         callback_data="cal_lavori:ignore"
     )
-    # Nomi giorni settimana
     for g in nomi_giorni:
         kb.button(text=g, callback_data="cal_lavori:ignore")
 
@@ -968,7 +933,6 @@ def build_lavori_calendar(
                     callback_data=f"cal_lavori:day:{year}:{month}:{day}"
                 )
 
-    # Navigazione mese
     kb.button(text="◀️ Mese prec.", callback_data=f"cal_lavori:nav:{year}:{month}:prev")
     kb.button(text="Mese succ. ▶️", callback_data=f"cal_lavori:nav:{year}:{month}:next")
     kb.adjust(1, 7, *([7] * len(weeks)), 2)
@@ -987,8 +951,10 @@ def _build_zones_markup(work_locations: Dict[str, Tuple[float, float]]):
     return kb.as_markup()
 
 
+# FIX 3: usa asyncio.to_thread invece di sheets_call per get_work_locations
+# che gestisce già internamente cache e chiamate Sheets
 async def _show_zones_list(target) -> None:
-    work_locations = await sheets_call(get_work_locations)
+    work_locations = await asyncio.to_thread(get_work_locations)
     text_vuoto = "❌ Nessuna zona trovata.\n\nAggiungi la tua prima zona di lavoro:"
     text_pieno = "📍 <b>Zone di lavoro disponibili:</b>\n\nSeleziona una zona per modificarla o rimuoverla, oppure aggiungi una nuova zona:"
 
@@ -1241,21 +1207,17 @@ def _build_tipo_lavoro_kb() -> types.InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+# FIX 2: usa il row index come riferimento nel callback_data invece del testo
+# (il testo può superare il limite di 64 byte di Telegram con caratteri UTF-8)
 def _build_note_kb(appunti: List[dict]) -> types.InlineKeyboardMarkup:
-    """
-    Costruisce la keyboard note.
-    Il testo dell'appunto viene codificato direttamente nel callback_data
-    (max 64 chars) così il handler non deve fare nessuna chiamata a Sheets.
-    """
     kb = InlineKeyboardBuilder()
     for app in appunti[:8]:
         testo = app["testo"]
         label = testo[:38] + ("…" if len(testo) > 38 else "")
-        # callback_data max 64 bytes: prefisso "lan:" (4) + testo (max 60)
-        cb_testo = testo[:60].replace(":", "；")   # evita split su ":" nel handler
+        # Usiamo il row index come ID — sicuro e sempre sotto i 64 byte
         kb.button(
             text=f"💬 {label}",
-            callback_data=f"lan:{cb_testo}"
+            callback_data=f"lan:{app['row']}"
         )
     kb.button(text="✏️ Scrivi nota libera", callback_data="lavoro_note:libera")
     kb.button(text="⏭️ Salta (nessuna nota)", callback_data="lavoro_note:skip")
@@ -1313,15 +1275,29 @@ async def lavoro_tipo(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ── appunto veloce: testo già nel callback_data, zero Sheets ──────────────
+# FIX 2 (continua): il handler recupera il testo dell'appunto da Sheets
+# tramite il row index ricevuto nel callback_data
 @dp.callback_query(F.data.startswith("lan:"))
 async def lavoro_note_da_appunto(cb: CallbackQuery, state: FSMContext):
     current = await state.get_state()
     if current != LavoroForm.waiting_for_note:
         await cb.answer()
         return
-    # Ripristina i ":" che avevamo sostituito con "；"
-    note = cb.data[4:].replace("；", ":")
+    try:
+        row_index = int(cb.data[4:])
+    except ValueError:
+        await cb.answer("⚠️ Dato non valido.", show_alert=True)
+        return
+    try:
+        appunti = await async_get_appunti(cb.from_user.id)
+    except asyncio.TimeoutError:
+        await cb.answer("⚠️ Timeout, riprova.", show_alert=True)
+        return
+    appunto = next((a for a in appunti if a["row"] == row_index), None)
+    if not appunto:
+        await cb.answer("⚠️ Appunto non trovato.", show_alert=True)
+        return
+    note = appunto["testo"]
     await cb.answer()
     await _salva_lavoro(cb, state, note, user=cb.from_user)
 
@@ -1371,21 +1347,18 @@ async def _salva_lavoro(
 
     is_cb = isinstance(trigger, CallbackQuery)
 
-    # helper per mandare messaggi nel modo giusto a seconda del trigger
     async def _send(text: str, **kwargs):
         if is_cb:
             await bot.send_message(trigger.message.chat.id, text, **kwargs)
         else:
             await trigger.answer(text, **kwargs)
 
-    # 1. Feedback immediato sui bottoni inline
     if is_cb:
         try:
             await trigger.message.edit_text("⏳ Salvataggio…")
         except Exception:
             pass
 
-    # 2. Salva su Sheets — timeout fisso 12s, cattura tutto
     ok = False
     try:
         ok = await asyncio.wait_for(
@@ -1401,7 +1374,6 @@ async def _salva_lavoro(
         await _send(f"❌ Errore: {e}", reply_markup=main_kb)
         return
 
-    # 3. Riepilogo + main_kb sempre visibile
     if ok:
         riepilogo = (
             "✅ <b>Lavoro registrato!</b>\n\n"
@@ -1417,9 +1389,7 @@ async def _salva_lavoro(
                 callback_data=f"appunto_salva_rapido:{note[:200]}",
             )
             kb_salva.adjust(1)
-            # prima manda il riepilogo con la main_kb (keyboard riappare)
             await _send(riepilogo, reply_markup=main_kb)
-            # poi manda il bottone "salva appunto" come messaggio separato senza keyboard
             await _send("💡 Vuoi riusare questa nota in futuro?", reply_markup=kb_salva.as_markup())
         else:
             await _send(riepilogo, reply_markup=main_kb)
@@ -1427,10 +1397,8 @@ async def _salva_lavoro(
         await _send("❌ Errore nel salvataggio. Controlla i log.", reply_markup=main_kb)
 
 
-
-@dp.message(F.data.startswith("appunto_salva_rapido:") if False else F.text == "/testlavoro")
+@dp.message(F.text == "/testlavoro")
 async def testlavoro_handler(message: Message):
-    """Admin: testa direttamente il salvataggio su foglio Produttività."""
     if message.from_user.id not in ADMINS:
         await message.answer("❌ Non autorizzato.")
         return
@@ -1450,9 +1418,11 @@ async def testlavoro_handler(message: Message):
         await message.answer(f"❌ Eccezione: <code>{e}</code>", reply_markup=main_kb)
 
 
-
+# FIX 1: aggiunto il decoratore @dp.callback_query mancante
+# Senza di esso il callback "appunto_salva_rapido:" non veniva mai gestito
+# e la FSM rimaneva bloccata in stato waiting_for_note
+@dp.callback_query(F.data.startswith("appunto_salva_rapido:"))
 async def appunto_salva_rapido_handler(cb: CallbackQuery):
-    """Salva la nota appena usata come nuovo appunto direttamente dalla conferma lavoro."""
     testo = cb.data.split(":", 1)[1]
     try:
         ok = await async_add_appunto(cb.from_user.id, testo)
@@ -1471,7 +1441,6 @@ async def appunto_salva_rapido_handler(cb: CallbackQuery):
 # ============================================================
 
 def _build_appunti_lista_kb(appunti: List[dict]) -> types.InlineKeyboardMarkup:
-    """Keyboard elenco appunti: ogni appunto ha bottone per visualizzarlo/modificarlo."""
     kb = InlineKeyboardBuilder()
     for app in appunti:
         testo_breve = app["testo"][:35] + ("…" if len(app["testo"]) > 35 else "")
@@ -1485,7 +1454,6 @@ def _build_appunti_lista_kb(appunti: List[dict]) -> types.InlineKeyboardMarkup:
 
 
 def _build_appunto_detail_kb(row_index: int) -> types.InlineKeyboardMarkup:
-    """Keyboard dettaglio singolo appunto: modifica, elimina, torna alla lista."""
     kb = InlineKeyboardBuilder()
     kb.button(text="✏️ Modifica", callback_data=f"appunto:edit:{row_index}")
     kb.button(text="🗑️ Elimina", callback_data=f"appunto:delete:{row_index}")
@@ -1496,7 +1464,6 @@ def _build_appunto_detail_kb(row_index: int) -> types.InlineKeyboardMarkup:
 
 @dp.message(F.text == "📋 I miei Appunti")
 async def appunti_handler(message: Message):
-    """Mostra la lista degli appunti salvati dell'utente."""
     try:
         appunti = await async_get_appunti(message.from_user.id)
     except asyncio.TimeoutError:
@@ -1524,7 +1491,6 @@ async def appunti_handler(message: Message):
 
 @dp.callback_query(F.data == "appunto:list")
 async def appunto_list_handler(cb: CallbackQuery):
-    """Torna alla lista appunti (usato dal dettaglio)."""
     try:
         appunti = await async_get_appunti(cb.from_user.id)
     except asyncio.TimeoutError:
@@ -1550,7 +1516,6 @@ async def appunto_list_handler(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "appunto:new")
 async def appunto_new_handler(cb: CallbackQuery, state: FSMContext):
-    """Avvia la creazione di un nuovo appunto."""
     await state.set_state(AppuntiForm.waiting_for_testo)
     await cb.message.edit_text(
         "➕ <b>Nuovo Appunto</b>\n\n"
@@ -1562,7 +1527,6 @@ async def appunto_new_handler(cb: CallbackQuery, state: FSMContext):
 
 @dp.message(AppuntiForm.waiting_for_testo)
 async def appunto_testo_handler(message: Message, state: FSMContext):
-    """Riceve il testo del nuovo appunto e lo salva."""
     testo = (message.text or "").strip()
     if not testo:
         await message.answer("⚠️ Il testo non può essere vuoto. Scrivi qualcosa:")
@@ -1592,7 +1556,6 @@ async def appunto_testo_handler(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("appunto:view:"))
 async def appunto_view_handler(cb: CallbackQuery):
-    """Mostra il dettaglio di un singolo appunto con opzioni modifica/elimina."""
     row_index = int(cb.data.split(":")[2])
     try:
         appunti = await async_get_appunti(cb.from_user.id)
@@ -1613,9 +1576,7 @@ async def appunto_view_handler(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("appunto:edit:"))
 async def appunto_edit_start(cb: CallbackQuery, state: FSMContext):
-    """Avvia la modifica di un appunto."""
     row_index = int(cb.data.split(":")[2])
-    # Recupera il testo attuale
     try:
         appunti = await async_get_appunti(cb.from_user.id)
     except asyncio.TimeoutError:
@@ -1637,7 +1598,6 @@ async def appunto_edit_start(cb: CallbackQuery, state: FSMContext):
 
 @dp.message(AppuntiForm.waiting_for_edit_testo)
 async def appunto_edit_testo_handler(message: Message, state: FSMContext):
-    """Riceve il nuovo testo e aggiorna l'appunto."""
     if (message.text or "").strip().lower() == "annulla":
         await state.clear()
         await message.answer("❌ Modifica annullata.", reply_markup=main_kb)
@@ -1672,7 +1632,6 @@ async def appunto_edit_testo_handler(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("appunto:delete:"))
 async def appunto_delete_confirm(cb: CallbackQuery):
-    """Chiede conferma prima di eliminare l'appunto."""
     row_index = int(cb.data.split(":")[2])
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Sì, elimina", callback_data=f"appunto:confirm_delete:{row_index}")
@@ -1687,7 +1646,6 @@ async def appunto_delete_confirm(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("appunto:confirm_delete:"))
 async def appunto_confirm_delete_handler(cb: CallbackQuery):
-    """Esegue la cancellazione dell'appunto."""
     row_index = int(cb.data.split(":")[2])
     try:
         ok = await async_delete_appunto(cb.from_user.id, row_index)
@@ -1695,7 +1653,6 @@ async def appunto_confirm_delete_handler(cb: CallbackQuery):
         await cb.answer("⚠️ Timeout, riprova.", show_alert=True)
         return
     if ok:
-        # Ricarica la lista aggiornata
         try:
             appunti = await async_get_appunti(cb.from_user.id)
         except asyncio.TimeoutError:
@@ -1724,10 +1681,6 @@ async def appunto_confirm_delete_handler(cb: CallbackQuery):
 
 @dp.message(F.text == "📆 Calendario Lavori")
 async def calendario_lavori_start(message: Message):
-    """
-    Mostra il calendario del mese corrente con i giorni evidenziati
-    dove l'utente ha registrato dei lavori.
-    """
     now = datetime.now(TIMEZONE)
     year, month = now.year, now.month
     user_id_str = f"{message.from_user.full_name} | {message.from_user.id}"
@@ -1767,7 +1720,6 @@ async def calendario_lavori_handler(cb: CallbackQuery):
 
     user_id_str = f"{cb.from_user.full_name} | {cb.from_user.id}"
 
-    # ── Navigazione mese ──────────────────────────────────
     if action == "nav":
         year, month, direction = int(parts[2]), int(parts[3]), parts[4]
         if direction == "prev":
@@ -1799,7 +1751,6 @@ async def calendario_lavori_handler(cb: CallbackQuery):
         )
         return
 
-    # ── Dettaglio giorno ──────────────────────────────────
     if action == "day":
         year, month, day = int(parts[2]), int(parts[3]), int(parts[4])
         giorno_str = f"{day:02d}.{month:02d}.{year}"
@@ -1819,7 +1770,6 @@ async def calendario_lavori_handler(cb: CallbackQuery):
             )
             return
 
-        # Costruisce il testo dettaglio
         righe = [f"📋 <b>Lavori del {giorno_str}</b>\n"]
         for i, lav in enumerate(lavori_giorno, start=1):
             tipo_emoji = "🔩" if lav["tipo"] == "Installazione" else "🔧"
@@ -1831,7 +1781,6 @@ async def calendario_lavori_handler(cb: CallbackQuery):
 
         righe.append(f"\n<i>Totale: {len(lavori_giorno)} lavoro/i</i>")
 
-        # Bottone per tornare al calendario
         kb = InlineKeyboardBuilder()
         kb.button(
             text=f"🔙 Torna a {mese_nome(month)} {year}",
@@ -1845,7 +1794,6 @@ async def calendario_lavori_handler(cb: CallbackQuery):
         )
         return
 
-    # ── Torna al calendario (da dettaglio giorno) ─────────
     if action == "back":
         year, month = int(parts[2]), int(parts[3])
 
