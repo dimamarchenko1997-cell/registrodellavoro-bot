@@ -1370,16 +1370,22 @@ async def _salva_lavoro(
     await state.clear()
 
     is_cb = isinstance(trigger, CallbackQuery)
-    chat_id = trigger.message.chat.id if is_cb else trigger.chat.id
 
-    # 1. Feedback visivo immediato — rimuove i bottoni inline subito
+    # helper per mandare messaggi nel modo giusto a seconda del trigger
+    async def _send(text: str, **kwargs):
+        if is_cb:
+            await bot.send_message(trigger.message.chat.id, text, **kwargs)
+        else:
+            await trigger.answer(text, **kwargs)
+
+    # 1. Feedback immediato sui bottoni inline
     if is_cb:
         try:
             await trigger.message.edit_text("⏳ Salvataggio…")
         except Exception:
             pass
 
-    # 2. Salva su Sheets — timeout fisso 12s, cattura TUTTO
+    # 2. Salva su Sheets — timeout fisso 12s, cattura tutto
     ok = False
     try:
         ok = await asyncio.wait_for(
@@ -1387,21 +1393,22 @@ async def _salva_lavoro(
             timeout=12.0,
         )
     except asyncio.TimeoutError:
-        logger.error("_salva_lavoro: timeout Sheets per user %s", user.id)
-        await bot.send_message(chat_id, "⚠️ Il server è lento. Il lavoro potrebbe non essere stato salvato. Riprova.", reply_markup=main_kb)
+        logger.error("_salva_lavoro: timeout per user %s", user.id)
+        await _send("⚠️ Il server è lento. Riprova.", reply_markup=main_kb)
         return
     except Exception as e:
-        logger.exception("_salva_lavoro: eccezione Sheets per user %s: %s", user.id, e)
-        await bot.send_message(chat_id, f"❌ Errore nel salvataggio: {e}", reply_markup=main_kb)
+        logger.exception("_salva_lavoro: errore per user %s: %s", user.id, e)
+        await _send(f"❌ Errore: {e}", reply_markup=main_kb)
         return
 
-    # 3. Riepilogo
+    # 3. Riepilogo + main_kb sempre visibile
     if ok:
         riepilogo = (
             "✅ <b>Lavoro registrato!</b>\n\n"
             f"🚌 Bus: <b>{numero_bus}</b>\n"
             f"🔧 Tipo: <b>{tipo}</b>\n"
-            f"📝 Note: {note if note else '—'}"
+            f"📝 Note: {note if note else '—'}\n\n"
+            "Scegli un'opzione:"
         )
         if note:
             kb_salva = InlineKeyboardBuilder()
@@ -1410,14 +1417,15 @@ async def _salva_lavoro(
                 callback_data=f"appunto_salva_rapido:{note[:200]}",
             )
             kb_salva.adjust(1)
-            await bot.send_message(chat_id, riepilogo, reply_markup=kb_salva.as_markup())
+            # prima manda il riepilogo con la main_kb (keyboard riappare)
+            await _send(riepilogo, reply_markup=main_kb)
+            # poi manda il bottone "salva appunto" come messaggio separato senza keyboard
+            await _send("💡 Vuoi riusare questa nota in futuro?", reply_markup=kb_salva.as_markup())
         else:
-            await bot.send_message(chat_id, riepilogo)
+            await _send(riepilogo, reply_markup=main_kb)
     else:
-        await bot.send_message(chat_id, "❌ Errore nel salvataggio. Controlla i log.")
+        await _send("❌ Errore nel salvataggio. Controlla i log.", reply_markup=main_kb)
 
-    # 4. Ripristina sempre la main_kb
-    await bot.send_message(chat_id, "Scegli un'opzione:", reply_markup=main_kb)
 
 
 @dp.message(F.data.startswith("appunto_salva_rapido:") if False else F.text == "/testlavoro")
